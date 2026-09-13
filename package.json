@@ -1,0 +1,17 @@
+{
+  "name": "nearby-booker-voice-relay",
+  "version": "0.1.2",
+  "private": true,
+  "description": "Isolated Phase 1 Twilio Media Streams to OpenAI Realtime relay for Nearby Booker SaaS; mobile-friendly flat-root deployment build.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
