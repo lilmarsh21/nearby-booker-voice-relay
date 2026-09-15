@@ -1,0 +1,1337 @@
+import http from 'node:http';
+import { URL } from 'node:url';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+import WebSocket, { WebSocketServer } from 'ws';
+
+const PORT = Number.parseInt(process.env.PORT || '8080', 10);
+const PROXY_BASE = (process.env.GEOVEE_PROXY_VOICE_BASE_URL || 'https://sub.geovee.io/wp-json/geovee/v1/voice').replace(/\/$/, '');
+const RELAY_SECRET = String(process.env.GEOVEE_VOICE_RELAY_SECRET || '').trim();
+const OPENAI_WS_BASE = String(process.env.OPENAI_REALTIME_WS_BASE || 'wss://api.openai.com/v1/realtime').trim();
+const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
+
+function log(level, message, data = {}) {
+  const ranks = { debug: 10, info: 20, warn: 30, error: 40 };
+  if ((ranks[level] || 20) < (ranks[LOG_LEVEL] || 20)) return;
+  // Never log audio payloads, ephemeral OpenAI secrets, relay secret, transcripts, or phone numbers.
+  const safe = { ...data };
+  for (const key of ['audio', 'delta', 'payload', 'openai_client_secret', 'session_token', 'transcript', 'from', 'to']) delete safe[key];
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level, message, ...safe }));
+}
+
+async function proxyPost(path, body) {
+  if (!RELAY_SECRET) throw new Error('GEOVEE_VOICE_RELAY_SECRET is not configured');
+  const raw = JSON.stringify(body);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const nonce = randomBytes(16).toString('hex');
+  const route = `/geovee/v1/voice${path}`;
+  const bodyHash = createHash('sha256').update(raw).digest('hex');
+  const canonical = ['POST', route, timestamp, nonce, bodyHash].join('\n');
+  const signature = createHmac('sha256', RELAY_SECRET).update(canonical).digest('hex');
+
+  const response = await fetch(`${PROXY_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'accept': 'application/json',
+      'x-geovee-voice-timestamp': timestamp,
+      'x-geovee-voice-nonce': nonce,
+      'x-geovee-voice-signature': signature,
+    },
+    body: raw,
+    // Availability/live-calendar checks can legitimately require more than the
+    // short control-plane timeout. Keep bootstrap/transfer fast while allowing
+    // NBB tool calls to finish instead of aborting before the tenant's 25s cap.
+    signal: AbortSignal.timeout(path === '/tool' ? 40000 : 15000),
+  });
+  const text = await response.text();
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }
+  if (!response.ok || !json || json.success === false) {
+    const error = new Error(json?.message || `GeoVee Proxy returned HTTP ${response.status}`);
+    error.status = response.status;
+    error.code = json?.code || 'proxy_error';
+    throw error;
+  }
+  return json;
+}
+
+function safeSend(ws, object) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(object));
+}
+
+function normalizedText(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function normalizedPhone(value) {
+  const digits = String(value || '').replace(/\D+/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits ? `+${digits}` : '';
+}
+
+function normalizedEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeEstimateDelivery(value) {
+  const t = normalizedText(value);
+  if (['sms', 'text', 'text message'].includes(t)) return 'sms';
+  if (['email', 'e mail'].includes(t)) return 'email';
+  if (['both', 'sms and email', 'email and sms', 'text and email', 'email and text'].includes(t)) return 'both';
+  return '';
+}
+
+function spokenEmail(value) {
+  const email = normalizedEmail(value);
+  if (!email) return '';
+  return email
+    .replace(/@/g, ' at ')
+    .replace(/\./g, ' dot ')
+    .replace(/_/g, ' underscore ')
+    .replace(/-/g, ' dash ')
+    .replace(/\+/g, ' plus ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function estimateDeliveryLabel(value) {
+  const delivery = normalizeEstimateDelivery(value);
+  if (delivery === 'sms') return 'text message';
+  if (delivery === 'email') return 'email';
+  if (delivery === 'both') return 'both text message and email';
+  return '';
+}
+
+function estimatePayloadSignature(toolArgs = {}) {
+  const customer = toolArgs && typeof toolArgs.customer === 'object' ? toolArgs.customer : {};
+  const services = Array.isArray(toolArgs?.services) ? toolArgs.services : [];
+  const normalizedServices = services
+    .map((row) => ({
+      service_uuid: String(row?.service_uuid || '').trim(),
+      quantity: Number(row?.quantity || 0),
+    }))
+    .filter((row) => row.service_uuid && Number.isFinite(row.quantity) && row.quantity > 0)
+    .sort((a, b) => a.service_uuid.localeCompare(b.service_uuid) || a.quantity - b.quantity);
+  return JSON.stringify({
+    name: normalizedText(customer?.name || ''),
+    services: normalizedServices,
+  });
+}
+
+function explicitEstimateDeliveryChoice(text) {
+  const t = normalizedText(text);
+  if (!t) return '';
+  const wantsSms = asksForTextMessage(text);
+  const wantsEmail = asksForEmailMessage(text);
+  if (wantsSms && wantsEmail) return 'both';
+  if (wantsSms) return 'sms';
+  if (wantsEmail) return 'email';
+  return '';
+}
+
+function pushInternalCallContext(state, text) {
+  if (!text || !state.openaiWs || state.openaiWs.readyState !== WebSocket.OPEN) return;
+  safeSend(state.openaiWs, {
+    type: 'conversation.item.create',
+    item: {
+      type: 'message',
+      role: 'system',
+      content: [{ type: 'input_text', text: `INTERNAL CALL STATE — never read this aloud: ${text}` }],
+    },
+  });
+}
+
+function customerContinuityInstruction(state) {
+  const known = [];
+  if (state.customerName) known.push(`name ${JSON.stringify(state.customerName)}`);
+  if (state.customerPhone) known.push(`phone ${JSON.stringify(state.customerPhone)}`);
+  if (state.customerEmail) known.push(`email ${JSON.stringify(state.customerEmail)}`);
+  if (!known.length) return '';
+  return `Customer details already captured earlier in this call: ${known.join(', ')}. Reuse these exact values for later estimate/booking steps and do not ask for them again unless a required field is missing or the caller explicitly changes it. Never read this internal state list aloud.`;
+}
+
+function slotSortKey(slot) {
+  if (!slot || typeof slot !== 'object') return '9999-99-99T99:99';
+  const date = String(slot.date || slot.service_date || '9999-99-99');
+  const window = slot.window && typeof slot.window === 'object' ? slot.window : {};
+  const start = String(window.start || slot.start || slot.start_time || '99:99');
+  return `${date}T${start}`;
+}
+
+function sortVoiceAvailabilityResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  const sortSlots = (rows) => Array.isArray(rows)
+    ? [...rows].sort((a, b) => slotSortKey(a).localeCompare(slotSortKey(b)))
+    : [];
+  const savings = sortSlots(result.savings_slots);
+  const standard = sortSlots(result.standard_slots);
+  if (Array.isArray(result.savings_slots)) result.savings_slots = savings;
+  if (Array.isArray(result.standard_slots)) result.standard_slots = standard;
+  if (savings.length || standard.length) result.slots = [...savings, ...standard];
+  return result;
+}
+
+function mergeKnownCustomer(state, toolArgs) {
+  const current = toolArgs?.customer && typeof toolArgs.customer === 'object' ? { ...toolArgs.customer } : {};
+  if (!current.name && state.customerName) current.name = state.customerName;
+  if (!current.phone && state.customerPhone) current.phone = state.customerPhone;
+  if (!current.phone && state.callerPhone) current.phone = state.callerPhone;
+  if (!current.email && state.customerEmail) current.email = state.customerEmail;
+  return { ...toolArgs, customer: current };
+}
+
+function bookingWrapupSatisfied(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  const allSet = t.includes('all set') || t.includes("you're set") || t.includes('you are set');
+  const goodbye = t.includes('thanks for calling') || t.includes('thank you for calling') || t.includes('have a great') || t.includes('goodbye') || t.includes('good bye');
+  return allSet && goodbye;
+}
+
+function asksForHuman(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  const phrases = [
+    'talk to someone', 'speak to someone', 'talk to somebody', 'speak to somebody',
+    'talk to a person', 'speak to a person', 'real person', 'live person',
+    'talk to a human', 'speak to a human', 'human please', 'representative',
+    'customer service', 'talk to the owner', 'speak to the owner', 'talk to the office',
+    'speak to the office', 'talk to staff', 'speak to staff'
+  ];
+  return phrases.some((phrase) => t.includes(phrase));
+}
+
+function matchesTenantPriority(text, keywords) {
+  const t = normalizedText(text);
+  if (!t || !Array.isArray(keywords)) return false;
+  return keywords.some((keyword) => {
+    const k = normalizedText(keyword);
+    return k.length >= 3 && t.includes(k);
+  });
+}
+
+function isAffirmativeBookingConfirmation(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  const exact = new Set(['yes', 'yeah', 'yep', 'correct', 'confirmed', 'confirm', 'sure', 'absolutely']);
+  if (exact.has(t)) return true;
+  const phrases = [
+    'yes please', 'that is correct', "that's correct", 'sounds good', 'that works',
+    'go ahead', 'book it', 'schedule it', 'please book it', 'please schedule it',
+    'confirm it', 'do it', 'yes book it', 'yes schedule it'
+  ];
+  return phrases.some((phrase) => t.includes(phrase));
+}
+
+function isNegativeBookingConfirmation(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  const phrases = ['no', 'nope', 'not yet', 'wait', 'hold on', 'change it', 'different time', 'cancel that', 'do not book', "don't book"];
+  return phrases.some((phrase) => t === phrase || t.includes(phrase));
+}
+
+function asksForTextMessage(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+
+  // Never turn an explicit refusal into consent just because the word "text"
+  // appears in the sentence.
+  const negative = [
+    "don't text", 'do not text', 'dont text', 'no text', 'not by text',
+    'not text', "don't sms", 'do not sms', 'dont sms', 'no sms', 'not by sms'
+  ];
+  if (negative.some((phrase) => t.includes(phrase))) return false;
+
+  if (['text', 'sms', 'text message', 'by text', 'by sms', 'via text', 'via sms'].includes(t)) return true;
+  const phrases = [
+    'text me', 'send me a text', 'send that by text', 'send it by text',
+    'send by text', 'send by sms', 'send me that in a text', 'sms me',
+    'send me an sms', 'text that to me', 'can you text', 'could you text',
+    'by text', 'via text', 'by sms', 'via sms', 'text please', 'sms please'
+  ];
+  if (phrases.some((phrase) => t.includes(phrase))) return true;
+
+  // Realtime transcription often turns short delivery answers into variants like
+  // "and by text" / "and I text". For a short affirmative answer, a standalone
+  // channel word is enough as long as no negative intent was detected above.
+  const words = t.split(' ').filter(Boolean);
+  return words.length <= 8 && (words.includes('text') || words.includes('sms'));
+}
+
+function asksForEmailMessage(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+
+  const negative = [
+    "don't email", 'do not email', 'dont email', 'no email', 'not by email',
+    'not email', "don't e mail", 'do not e mail', 'not by e mail'
+  ];
+  if (negative.some((phrase) => t.includes(phrase))) return false;
+
+  if (['email', 'e mail', 'by email', 'by e mail', 'via email', 'via e mail'].includes(t)) return true;
+  const phrases = [
+    'email me', 'send me an email', 'send that by email', 'send it by email',
+    'send by email', 'send that to my email', 'email that to me', 'can you email',
+    'could you email', 'by email', 'via email', 'email please'
+  ];
+  if (phrases.some((phrase) => t.includes(phrase))) return true;
+
+  const words = t.split(' ').filter(Boolean);
+  return words.length <= 8 && (words.includes('email') || (words.includes('e') && words.includes('mail')));
+}
+
+function createConnectionState(twilioWs) {
+  return {
+    twilioWs,
+    openaiWs: null,
+    streamSid: '',
+    callSid: '',
+    sessionId: '',
+    model: '',
+    rules: {},
+    businessName: '',
+    callerPhone: '',
+    customerName: '',
+    customerPhone: '',
+    customerEmail: '',
+    confirmedPhone: '',
+    confirmedEmail: '',
+    estimateDeliveryPreference: '',
+    estimateDeliverySelectedAt: 0,
+    estimateSentAt: 0,
+    estimateSentDelivery: '',
+    lastEstimateId: '',
+    lastEstimateSignature: '',
+    conversationMessages: [],
+    sessionPurpose: 'normal',
+    pendingContactConfirmation: null,
+    bookingWrapupRequired: false,
+    bookingWrapupRetryCount: 0,
+    callbackWrapupRequired: false,
+    callbackWrapupRetryCount: 0,
+    startedAt: Date.now(),
+    bootstrapped: false,
+    transferInProgress: false,
+    ended: false,
+    maxTimer: null,
+    pendingAudio: [],
+    startupAudioGate: true,
+    greetingAudioStarted: false,
+    openingGreetingRequested: false,
+    droppedStartupAudioFrames: 0,
+    pendingFunctionArgs: new Map(),
+    handledFunctionCalls: new Set(),
+    lastReviewToken: '',
+    preparedAt: 0,
+    bookingConfirmationAt: 0,
+    awaitingBookingConfirmation: false,
+    smsRequestAt: 0,
+    emailRequestAt: 0,
+    responseActive: false,
+    responseRequestPending: false,
+    queuedResponseInstructions: '',
+    queuedResponseReason: '',
+    continuationTimer: null,
+    continuationStartedAt: 0,
+    continuationReason: '',
+    continuationRetryCount: 0,
+    toolProgressTimers: new Map(),
+    transcriptChain: Promise.resolve(),
+  };
+}
+
+function voiceConversationId(state) {
+  const safe = String(state.sessionId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 56);
+  return safe ? `voice_${safe}` : '';
+}
+
+function reportVoiceEvent(state, payload = {}) {
+  if (!state.rules?.transcripts_enabled || !state.sessionId || state.ended) return Promise.resolve();
+  const conversationId = voiceConversationId(state);
+  if (!conversationId) return Promise.resolve();
+  const args = { conversation_id: conversationId, ...payload };
+
+  // Serialize tenant transcript writes per call. The NBB transcript store uses
+  // read/merge/upsert semantics, so ordered writes prevent a fast diagnostic
+  // event from overwriting a just-arrived caller/assistant message.
+  state.transcriptChain = (state.transcriptChain || Promise.resolve())
+    .catch(() => {})
+    .then(() => proxyPost('/tool', {
+      session_id: state.sessionId,
+      tool_name: 'nbb_log_voice_event',
+      arguments: args,
+    }))
+    .catch((error) => {
+      log('warn', 'Voice transcript event could not be stored', {
+        callSid: state.callSid,
+        code: error?.code || 'voice_transcript_store_failed',
+      });
+    });
+  return state.transcriptChain;
+}
+
+function clearContinuationWatchdog(state) {
+  if (state.continuationTimer) clearTimeout(state.continuationTimer);
+  state.continuationTimer = null;
+  state.continuationStartedAt = 0;
+  state.continuationReason = '';
+}
+
+function scheduleContinuationWatchdog(state, instructions, reason) {
+  clearContinuationWatchdog(state);
+  const seconds = Math.max(4, Math.min(20, Number(state.rules?.dead_air_seconds || 7)));
+  state.continuationStartedAt = Date.now();
+  state.continuationReason = reason;
+  state.continuationTimer = setTimeout(() => {
+    if (state.ended || !state.openaiWs || state.openaiWs.readyState !== WebSocket.OPEN) return;
+    state.continuationRetryCount += 1;
+    log('warn', 'Voice continuation produced no audio; retrying once', {
+      callSid: state.callSid,
+      reason,
+      retry: state.continuationRetryCount,
+    });
+    reportVoiceEvent(state, {
+      kind: 'diagnostic',
+      event: 'voice_continuation_retry',
+      realtime_event: 'dead_air_watchdog',
+      continuation_retry: state.continuationRetryCount,
+      duration_ms: Date.now() - state.continuationStartedAt,
+      diagnostic_message: `No AI audio began after ${seconds} seconds; continuation retried.`,
+    });
+    clearContinuationWatchdog(state);
+    if (state.continuationRetryCount > 1) return;
+    safeSend(state.openaiWs, { type: 'response.cancel' });
+    state.responseActive = false;
+    state.responseRequestPending = false;
+    setTimeout(() => {
+      requestModelResponse(
+        state,
+        instructions || 'Continue the phone conversation now using the latest tool result. Do not wait for the caller to prompt you.',
+        `${reason}_retry`,
+        false
+      );
+    }, 250);
+  }, seconds * 1000);
+}
+
+function dynamicVoiceResponseRules(state) {
+  const rules = [];
+  if (state.rules?.ask_one_question) {
+    rules.push('ONE-QUESTION RULE IS ON: never ask more than one customer-facing question in this response. When gathering information, ask for exactly one missing item, then STOP and wait for the caller before asking for the next item. Do not bundle service, quantity, address, name, email, delivery preference, scheduling preference, or other missing fields into one turn. This applies after tool results and continuation responses too.');
+  }
+  if (state.rules?.show_arrival_time) {
+    rules.push("SHOW ARRIVAL TIME IS ON: every appointment time you speak must use the exact words 'arrival time between' followed by both the start and end times. Never speak only the start time.");
+  }
+  if (state.rules?.quotes_enabled === false) {
+    rules.push('PHONE SPOKEN PRICING IS OFF: do not state or infer service prices, line-item costs, quote totals, appointment totals, minimum charges, or grand totals. This does NOT block creating a real estimate: if the caller wants a quote sent, collect the required customer/service information and use nbb_send_estimate. Never tell the caller that pricing visibility is off or disabled. A savings_amount/spoken_savings explicitly returned for a savings date is allowed and should be stated because it reveals only the amount saved.');
+  }
+  if (state.rules?.callback_only) {
+    rules.push('CALLBACK-COLLECTION MODE: collect a brief callback reason and customer name when practical, reuse the verified caller phone unless they explicitly provide a different confirmed number, submit nbb_request_callback, then confirm success and close with thanks/goodbye. Do not start quote, availability, estimate, or booking flows.');
+  }
+  if (state.estimateDeliveryPreference) {
+    rules.push(`ESTIMATE DELIVERY IS LOCKED FOR THIS CALL: the caller selected ${estimateDeliveryLabel(state.estimateDeliveryPreference)}. Do not ask text/email/both again unless the caller explicitly changes that preference.`);
+  }
+  if (state.confirmedEmail) {
+    rules.push(`EMAIL IS CONFIRMED AND LOCKED FOR THIS CALL: use the exact canonical address ${JSON.stringify(state.confirmedEmail)}. Do not ask the caller to confirm it again and do not substitute a different address unless the caller explicitly changes it.`);
+  }
+  const continuity = customerContinuityInstruction(state);
+  if (continuity) rules.push(continuity);
+  return rules.join(' ');
+}
+
+function applyVoicePresentationFromResult(state, result) {
+  const presentation = result && typeof result === 'object' && result.presentation && typeof result.presentation === 'object'
+    ? result.presentation
+    : null;
+  if (!presentation) return;
+  if (Object.prototype.hasOwnProperty.call(presentation, 'show_arrival_time')) {
+    state.rules.show_arrival_time = Boolean(Number(presentation.show_arrival_time));
+  }
+  if (Object.prototype.hasOwnProperty.call(presentation, 'pricing_spoken_allowed')) {
+    state.rules.quotes_enabled = Boolean(Number(presentation.pricing_spoken_allowed));
+  }
+}
+
+function afterToolResponseInstructions(state, name, result) {
+  const parts = [
+    'Continue naturally now using only the exact Nearby Booker tool result. Do not wait for the caller to prompt you. If the tool validated, sent, or booked something, state only what the result confirms.'
+  ];
+
+  if (name === 'nbb_get_business_context') {
+    parts.push('Consume this business context SILENTLY. Never read or paraphrase capability state, toggles, configuration, pricing visibility, booking enablement, service metadata, or internal status to the caller. Use it only to ask the next natural customer-facing question.');
+  }
+
+  if (name === 'nbb_send_estimate' && result && typeof result === 'object') {
+    parts.push('This is a real Nearby Booker estimate-delivery result. If sent is true, use the returned spoken_confirmation as the customer-facing status. Say it was submitted for delivery; do not promise that an email has already reached the inbox or that a deferred text has already arrived. The delivery preference and any confirmed email/phone are already locked in Relay state: do NOT ask text/email/both again and do NOT reconfirm an already-confirmed email or phone. Do NOT speak the estimate total when spoken pricing is off. Do not mention tools, settings, review tokens, internal workflow, or pricing visibility. The customer identity captured for this estimate remains valid for the rest of this call: if they next ask to schedule, reuse their known name/phone/email and do not collect those fields again unless one is actually missing or they explicitly change it. Do not ask the caller to reconfirm the Twilio caller phone number.');
+  }
+
+  if (name === 'nbb_validate_address' && result && typeof result === 'object') {
+    parts.push('The address check just completed. If Nearby Booker accepted/canonicalized the address, do NOT say technical phrases such as address validation succeeded, eligible to continue, validation result, or confirmation policy. Acknowledge naturally in a few words and CONTINUE THE SCHEDULING FLOW IN THIS SAME TURN. If the caller has not yet supplied the configured service selections/quantities needed for availability, ask exactly one concise service question next. If the required services/quantities are already known from the conversation, call nbb_get_availability immediately using the validated address. Never end this turn with only a status statement after a successful address check. If the address was rejected or materially incomplete, ask only for the missing/corrected address information.');
+  }
+
+  if (state.rules?.show_arrival_time && ['nbb_get_availability', 'nbb_prepare_booking', 'nbb_commit_booking'].includes(name)) {
+    parts.push("For every appointment window in this response, say 'arrival time between' and both endpoints. If spoken_window is present, use that wording. Never shorten a window to only its start time.");
+  }
+
+  if (name === 'nbb_get_availability' && result && typeof result === 'object') {
+    const savings = Array.isArray(result.savings_slots) ? result.savings_slots : [];
+    if (savings.length) {
+      parts.push("Keep the first phone presentation short. The savings slots are already sorted chronologically. Present ONLY the first three savings slots initially, then stop and ask which one they prefer or whether they want more options. Do NOT begin reading standard availability in the same response while savings dates exist unless the caller specifically asked for standard/other dates. The first time you explain savings dates, say they are dates when the business is already scheduled to be in the caller's area, which allows a better rate. For each savings slot you actually present, state the exact positive savings_amount/spoken_savings.");
+    } else {
+      parts.push('The standard slots are sorted chronologically. Present at most the first three openings initially, then ask which one they prefer or whether they want more options. Do not dump a long list of appointment times over the phone.');
+    }
+  }
+
+  if (name === 'nbb_commit_booking' && result && typeof result === 'object' && result.booking_id) {
+    parts.push(`BOOKING SUBMISSION SUCCEEDED. This response MUST close the transaction naturally. State only the status Nearby Booker returned, repeat the appointment window using the required arrival wording, explain the approval/confirmation next step if applicable, then explicitly say "You're all set", thank the caller for calling ${state.businessName || 'the business'}, and give a brief goodbye. Do not leave silence after the confirmation and do not end with "anything else?" or another open question.`);
+  }
+
+  if (name === 'nbb_request_callback' && result && typeof result === 'object' && result.sent) {
+    parts.push(`CALLBACK REQUEST SUCCEEDED. Tell the caller the callback request was sent to ${state.businessName || 'the business'}, confirm the callback number only if useful, thank them for calling, and give a brief goodbye. Do not ask another question and do not claim a specific callback time unless the tool result explicitly provided one.`);
+  }
+
+  if (state.rules?.quotes_enabled === false) {
+    parts.push('Do not reveal any full service price or estimate total from this result or from memory. Savings amounts explicitly returned for savings dates are the only pricing-like amounts you may say.');
+  }
+  return parts.join(' ');
+}
+
+function requestModelResponse(state, instructions = '', reason = 'normal', watchForAudio = false) {
+  if (!state.openaiWs || state.openaiWs.readyState !== WebSocket.OPEN || state.ended) return false;
+  if (state.responseActive || state.responseRequestPending) {
+    state.queuedResponseInstructions = instructions;
+    state.queuedResponseReason = reason;
+    return false;
+  }
+  const dynamicRules = dynamicVoiceResponseRules(state);
+  const effectiveInstructions = dynamicRules
+    ? (instructions ? `${instructions} ${dynamicRules}` : dynamicRules)
+    : instructions;
+  const response = {};
+  if (effectiveInstructions) response.instructions = effectiveInstructions;
+  safeSend(state.openaiWs, { type: 'response.create', response });
+  state.responseRequestPending = true;
+  if (watchForAudio) scheduleContinuationWatchdog(state, instructions, reason);
+  return true;
+}
+
+function flushQueuedResponse(state) {
+  if (!state.queuedResponseInstructions && !state.queuedResponseReason) return;
+  const instructions = state.queuedResponseInstructions;
+  const reason = state.queuedResponseReason || 'queued';
+  state.queuedResponseInstructions = '';
+  state.queuedResponseReason = '';
+  setTimeout(() => requestModelResponse(state, instructions, reason, reason === 'after_tool'), 50);
+}
+
+async function beginOpenAI(state, sessionToken) {
+  const boot = await proxyPost('/session/bootstrap', { session_token: sessionToken });
+  if (!boot?.openai_client_secret || !boot?.session_id || !boot?.model) throw new Error('Voice bootstrap response is incomplete');
+  state.sessionId = String(boot.session_id);
+  state.callSid = String(boot.call_sid || state.callSid || '');
+  if (String(boot.model) !== 'gpt-realtime-2.1') throw new Error('GeoVee Phone AI model policy mismatch');
+  state.model = 'gpt-realtime-2.1';
+  state.rules = boot.rules || {};
+  state.sessionPurpose = String(boot.session_purpose || (state.rules?.callback_only ? 'callback_only' : 'normal'));
+  state.businessName = String(boot.business_name || '');
+  state.callerPhone = normalizedPhone(boot.caller_phone || '');
+  if (state.callerPhone) {
+    state.customerPhone = state.callerPhone;
+    state.confirmedPhone = state.callerPhone;
+  }
+  state.openingGreeting = String(boot.opening_greeting || 'Thanks for calling. How can I help you today?');
+  state.bootstrapped = true;
+
+  const url = new URL(OPENAI_WS_BASE);
+  url.searchParams.set('model', state.model);
+  const openaiWs = new WebSocket(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${boot.openai_client_secret}`,
+      'OpenAI-Safety-Identifier': `nbb-voice-${state.sessionId.slice(0, 24)}`,
+    },
+  });
+  state.openaiWs = openaiWs;
+
+  openaiWs.on('open', () => {
+    log('info', 'OpenAI Realtime connected', { callSid: state.callSid, model: state.model });
+
+    // Reliability rule: never feed startup caller audio into Realtime before the
+    // configured greeting has actually begun. Otherwise early speech/background
+    // noise can trigger VAD/barge-in and clear the greeting before the caller hears it.
+    const buffered = state.pendingAudio.splice(0).length;
+    if (buffered > 0) state.droppedStartupAudioFrames += buffered;
+    if (state.callerPhone) {
+      pushInternalCallContext(state, `The verified Twilio caller number is ${state.callerPhone}. Reuse it for estimates/bookings instead of asking the caller to repeat the same number. If the caller explicitly requests a different booking number, collect and confirm that alternate number once.`);
+    }
+    state.openingGreetingRequested = true;
+    requestModelResponse(
+      state,
+      `Speak exactly this opening greeting and nothing else before waiting for the caller: ${JSON.stringify(state.openingGreeting)}. Do not mention settings, enabled features, tools, integrations, or configuration.`,
+      'opening_greeting',
+      true
+    );
+  });
+
+  openaiWs.on('message', (data) => handleOpenAIEvent(state, data));
+  openaiWs.on('error', (error) => {
+    log('error', 'OpenAI Realtime socket error', { callSid: state.callSid, error: error?.message || 'socket_error' });
+  });
+  openaiWs.on('close', (code) => {
+    log('info', 'OpenAI Realtime disconnected', { callSid: state.callSid, code });
+    // If Realtime dies unexpectedly, end the Media Stream so Twilio can continue
+    // to the Voice-only fallback TwiML supplied by the Proxy instead of leaving
+    // the caller in dead air. Intentional transfers/session shutdowns are excluded.
+    if (!state.ended && !state.transferInProgress && state.twilioWs?.readyState === WebSocket.OPEN) {
+      log('warn', 'Realtime ended unexpectedly; releasing Twilio stream to fallback', { callSid: state.callSid, code });
+      try { state.twilioWs.close(1011, 'Realtime unavailable'); } catch {}
+    }
+  });
+
+  const maxMinutes = Math.max(1, Math.min(180, Number(boot.max_call_minutes || 20)));
+  state.maxTimer = setTimeout(() => {
+    log('info', 'Maximum AI call duration reached', { callSid: state.callSid, maxMinutes });
+    safeSend(state.twilioWs, { event: 'clear', streamSid: state.streamSid });
+    try { state.twilioWs.close(1000, 'AI call limit reached'); } catch {}
+  }, maxMinutes * 60 * 1000);
+}
+
+async function executeTransfer(state, reason, source = 'rule') {
+  if (state.transferInProgress || state.ended || !state.sessionId) return;
+  state.transferInProgress = true;
+  try {
+    safeSend(state.twilioWs, { event: 'clear', streamSid: state.streamSid });
+    safeSend(state.openaiWs, { type: 'response.cancel' });
+    await proxyPost('/call/transfer', { session_id: state.sessionId, reason });
+    log('info', 'Human transfer initiated', { callSid: state.callSid, reason, source });
+    if (state.openaiWs?.readyState === WebSocket.OPEN) state.openaiWs.close(1000, 'Transferred');
+  } catch (error) {
+    state.transferInProgress = false;
+    log('warn', 'Human transfer failed', { callSid: state.callSid, reason, source, error: error?.message || 'transfer_failed' });
+    // Tell the model the tool failed so it can transparently continue instead of pretending transfer succeeded.
+    safeSend(state.openaiWs, {
+      type: 'conversation.item.create',
+      item: { type: 'message', role: 'system', content: [{ type: 'input_text', text: 'The attempted human transfer failed. Tell the caller briefly that the transfer could not be completed and offer to continue helping. Do not claim the transfer succeeded.' }] },
+    });
+    requestModelResponse(state, 'Tell the caller briefly that the transfer could not be completed and offer to continue helping.', 'transfer_failed', true);
+  }
+}
+
+function acknowledgeFunction(state, callId, output) {
+  if (!callId) return;
+  safeSend(state.openaiWs, {
+    type: 'conversation.item.create',
+    item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(output) },
+  });
+}
+
+async function executeNbbTool(state, name, callId, args = {}) {
+  if (!state.sessionId) {
+    acknowledgeFunction(state, callId, { success: false, code: 'voice_session_missing', message: 'Nearby Booker session is not ready yet.' });
+    requestModelResponse(state, 'Briefly explain that the phone assistant is still initializing and ask the caller to try that request again.', 'tool_not_ready', true);
+    return;
+  }
+
+  let toolArgs = args && typeof args === 'object' ? { ...args } : {};
+
+  if (['nbb_prepare_booking', 'nbb_send_estimate', 'nbb_request_callback'].includes(name)) {
+    toolArgs = mergeKnownCustomer(state, toolArgs);
+  }
+
+  // Precision contact fields: server-owned state is authoritative. The Twilio
+  // caller number is already verified. A dictated email is confirmed once. If the
+  // model later proposes a genuinely different contact value, treat that as a
+  // candidate change and confirm the NEW value once instead of silently forcing
+  // the old one forever.
+  if (['nbb_prepare_booking', 'nbb_send_estimate', 'nbb_request_callback'].includes(name) && toolArgs?.customer && typeof toolArgs.customer === 'object') {
+    let candidatePhone = normalizedPhone(toolArgs.customer.phone || '');
+    let candidateEmail = normalizedEmail(toolArgs.customer.email || '');
+    const requestedEstimateDelivery = normalizeEstimateDelivery(toolArgs.delivery || '');
+    const effectiveEstimateDelivery = requestedEstimateDelivery || state.estimateDeliveryPreference;
+    const usesEmail = name === 'nbb_prepare_booking' || (name === 'nbb_send_estimate' && ['email', 'both'].includes(effectiveEstimateDelivery));
+
+    if (state.confirmedPhone) {
+      if (candidatePhone && candidatePhone !== state.confirmedPhone && candidatePhone !== state.callerPhone) {
+        state.pendingContactConfirmation = { type: 'phone', value: candidatePhone };
+        acknowledgeFunction(state, callId, { success: false, code: 'voice_phone_confirmation_required', message: 'The alternate booking phone number must be confirmed by the caller.' });
+        requestModelResponse(state, `Before continuing, read back this alternate phone number exactly once: ${JSON.stringify(candidatePhone)}. Ask the caller if that is correct. Do not call the booking/estimate tool again until they answer.`, 'phone_confirmation_required', true);
+        return;
+      }
+      candidatePhone = state.confirmedPhone;
+      toolArgs.customer.phone = state.confirmedPhone;
+    } else if (candidatePhone && candidatePhone !== state.callerPhone) {
+      state.pendingContactConfirmation = { type: 'phone', value: candidatePhone };
+      acknowledgeFunction(state, callId, { success: false, code: 'voice_phone_confirmation_required', message: 'The alternate booking phone number must be confirmed by the caller.' });
+      requestModelResponse(state, `Before continuing, read back this alternate phone number exactly once: ${JSON.stringify(candidatePhone)}. Ask the caller if that is correct. Do not call the booking/estimate tool again until they answer.`, 'phone_confirmation_required', true);
+      return;
+    }
+
+    if (usesEmail && state.confirmedEmail) {
+      if (candidateEmail && candidateEmail !== state.confirmedEmail) {
+        state.pendingContactConfirmation = { type: 'email', value: candidateEmail };
+        const speech = spokenEmail(candidateEmail);
+        acknowledgeFunction(state, callId, { success: false, code: 'voice_email_confirmation_required', message: 'The new email address must be confirmed by the caller.' });
+        requestModelResponse(
+          state,
+          `The caller supplied a different email. Confirm the new address exactly once. Say exactly: "I have ${speech}. Is that correct?" Speak "at" and "dot" as words. Do not silently correct, autocomplete, or guess any part of it.`,
+          'email_change_confirmation_required',
+          true
+        );
+        return;
+      }
+      candidateEmail = state.confirmedEmail;
+      toolArgs.customer.email = state.confirmedEmail;
+    } else if (usesEmail && candidateEmail) {
+      state.pendingContactConfirmation = { type: 'email', value: candidateEmail };
+      const speech = spokenEmail(candidateEmail);
+      acknowledgeFunction(state, callId, { success: false, code: 'voice_email_confirmation_required', message: 'The email address must be confirmed by the caller.' });
+      requestModelResponse(
+        state,
+        `Confirm the email exactly once. Speak the punctuation as words so the caller can hear every separator. Say exactly: "I have ${speech}. Is that correct?" Do NOT speak or display the @ symbol in this confirmation; say the word "at". Do not silently correct, autocomplete, or guess any part of the address. Do not call the booking/estimate tool again until the caller answers.`,
+        'email_confirmation_required',
+        true
+      );
+      return;
+    }
+  }
+
+  if (name === 'nbb_get_quote' && state.rules?.quotes_enabled === false) {
+    acknowledgeFunction(state, callId, {
+      success: false,
+      code: 'voice_spoken_pricing_disabled',
+      message: 'Spoken pricing is unavailable; use the estimate-delivery workflow when the caller wants a quote sent.',
+    });
+    requestModelResponse(
+      state,
+      'Do not mention pricing settings or say pricing is disabled. If the caller wants a quote, continue gathering the configured services and quantities and ask whether they want the real estimate sent by text, email, or both, unless they already chose a delivery method. Use nbb_send_estimate once the required information is collected.',
+      'pricing_delivery_redirect',
+      true
+    );
+    return;
+  }
+
+  if (name === 'nbb_send_estimate') {
+    const requestedDelivery = normalizeEstimateDelivery(toolArgs?.delivery || '');
+
+    // The normalized estimate tool argument represents the caller's CURRENT
+    // delivery choice. Never let an older Relay value override a newer explicit
+    // choice. This removes the old phrase-dependent "switch/instead/only" gate.
+    if (requestedDelivery && requestedDelivery !== state.estimateDeliveryPreference) {
+      const previous = state.estimateDeliveryPreference;
+      state.estimateDeliveryPreference = requestedDelivery;
+      state.estimateDeliverySelectedAt = Date.now();
+      pushInternalCallContext(
+        state,
+        previous
+          ? `The caller's current estimate delivery choice is now ${estimateDeliveryLabel(requestedDelivery)}. Replace the previous ${estimateDeliveryLabel(previous)} choice. Do not ask again.`
+          : `Estimate delivery preference is now ${estimateDeliveryLabel(requestedDelivery)}. Do not ask for the delivery method again unless the caller changes it.`
+      );
+    }
+
+    const delivery = requestedDelivery || state.estimateDeliveryPreference;
+    if (!delivery) {
+      acknowledgeFunction(state, callId, {
+        success: false,
+        code: 'estimate_delivery_missing',
+        message: 'No estimate delivery channel has been selected.',
+      });
+      requestModelResponse(
+        state,
+        'Ask one concise question for the estimate delivery preference: text, email, or both. After the caller answers, use that current choice.',
+        'estimate_delivery_required',
+        true
+      );
+      return;
+    }
+
+    const wantsSms = delivery === 'sms' || delivery === 'both';
+    const wantsEmail = delivery === 'email' || delivery === 'both';
+    if ((wantsSms && state.rules?.sms_enabled === false) || (wantsEmail && state.rules?.email_enabled === false)) {
+      acknowledgeFunction(state, callId, {
+        success: false,
+        code: 'estimate_delivery_capability_unavailable',
+        message: 'The selected estimate delivery channel is not available for this tenant.',
+      });
+      requestModelResponse(state, 'Briefly explain that the selected delivery method is unavailable and offer only the enabled delivery methods.', 'estimate_delivery_unavailable', true);
+      return;
+    }
+
+    toolArgs.delivery = delivery;
+
+    // Repeated delivery of unchanged quote details is a RESEND, not a new quote.
+    // Relay supplies the authoritative estimate id to the signed NBB Voice adapter;
+    // NBB then reuses its existing estimate-delivery system without creating a
+    // second estimate row. If the customer name or quoted service/quantity details changed, the signature
+    // changes and NBB creates a fresh estimate instead.
+    const signature = estimatePayloadSignature(toolArgs);
+    if (state.lastEstimateId && state.lastEstimateSignature && signature === state.lastEstimateSignature) {
+      toolArgs.existing_estimate_id = state.lastEstimateId;
+    }
+  }
+
+  if (name === 'nbb_send_sms') {
+    const fresh = state.rules?.sms_enabled && state.smsRequestAt > 0 && (Date.now() - state.smsRequestAt) <= 120000;
+    if (!fresh) {
+      acknowledgeFunction(state, callId, {
+        success: false,
+        code: 'explicit_sms_request_required',
+        message: 'The caller has not recently and explicitly asked to receive a text message.',
+      });
+      requestModelResponse(state, 'Do not send a text yet. Ask whether the caller wants the requested information sent by text message.', 'sms_confirmation_required', true);
+      return;
+    }
+  }
+
+  if (name === 'nbb_send_email') {
+    const fresh = state.rules?.email_enabled && state.emailRequestAt > 0 && (Date.now() - state.emailRequestAt) <= 120000;
+    if (!fresh) {
+      acknowledgeFunction(state, callId, {
+        success: false,
+        code: 'explicit_email_request_required',
+        message: 'The caller has not recently and explicitly asked to receive an email.',
+      });
+      requestModelResponse(state, 'Do not send an email yet. Ask whether the caller wants the requested information sent by email.', 'email_confirmation_required', true);
+      return;
+    }
+  }
+
+  if (name === 'nbb_request_callback') {
+    if (!state.rules?.callback_enabled) {
+      acknowledgeFunction(state, callId, { success: false, code: 'callback_disabled', message: 'Callback collection is not enabled for this tenant.' });
+      requestModelResponse(state, 'Briefly explain that a callback request cannot be submitted right now. Do not claim it was sent.', 'callback_disabled', true);
+      return;
+    }
+    toolArgs = mergeKnownCustomer(state, toolArgs);
+    if (!toolArgs.customer || typeof toolArgs.customer !== 'object') toolArgs.customer = {};
+    if (!toolArgs.customer.phone && state.callerPhone) toolArgs.customer.phone = state.callerPhone;
+    toolArgs.conversation_id = voiceConversationId(state);
+    toolArgs.conversation = state.conversationMessages.slice(-24);
+    if (!toolArgs.request_text) toolArgs.request_text = 'Caller requested a callback from the business.';
+  }
+
+  if (name === 'nbb_commit_booking') {
+    if (!state.lastReviewToken) {
+      acknowledgeFunction(state, callId, { success: false, code: 'booking_not_prepared', message: 'No validated Nearby Booker booking is ready to submit.' });
+      requestModelResponse(state, 'Explain briefly that the appointment must be prepared and reviewed before it can be submitted.', 'booking_not_prepared', true);
+      return;
+    }
+    const confirmationFresh = state.bookingConfirmationAt > 0
+      && state.bookingConfirmationAt >= state.preparedAt
+      && (Date.now() - state.bookingConfirmationAt) <= 120000;
+    if (!confirmationFresh) {
+      acknowledgeFunction(state, callId, { success: false, code: 'explicit_confirmation_required', message: 'The caller has not explicitly confirmed the prepared booking yet.' });
+      requestModelResponse(state, 'Read back the validated booking review and ask the caller for a clear yes before trying to submit it.', 'booking_confirmation_required', true);
+      return;
+    }
+    // The model never supplies or chooses the review token. The Relay commits
+    // only the most recent review returned by the tenant's real NBB engine.
+    toolArgs = { review_token: state.lastReviewToken };
+  }
+
+  const startedAt = Date.now();
+  reportVoiceEvent(state, {
+    kind: 'diagnostic',
+    event: 'voice_tool_start',
+    tool_name: name,
+    tool_phase: 'start',
+  });
+
+  const progressDelay = Math.max(4, Math.min(20, Number(state.rules?.dead_air_seconds || 7))) * 1000;
+  const progressTimer = setTimeout(() => {
+    if (state.ended) return;
+    requestModelResponse(
+      state,
+      'Say one short sentence that you are still checking that information. Do not ask a question, do not claim a result, and do not mention technical details.',
+      'tool_progress',
+      false
+    );
+  }, progressDelay);
+  if (callId) state.toolProgressTimers.set(callId, progressTimer);
+
+  try {
+    const response = await proxyPost('/tool', {
+      session_id: state.sessionId,
+      tool_name: name,
+      arguments: toolArgs,
+    });
+    clearTimeout(progressTimer);
+    if (callId) state.toolProgressTimers.delete(callId);
+
+    let result = response?.result ?? {};
+    if (name === 'nbb_get_availability') result = sortVoiceAvailabilityResult(result);
+    const durationMs = Date.now() - startedAt;
+    applyVoicePresentationFromResult(state, result);
+
+    if (['nbb_prepare_booking', 'nbb_send_estimate', 'nbb_request_callback'].includes(name) && toolArgs?.customer && typeof toolArgs.customer === 'object') {
+      state.customerName = String(toolArgs.customer.name || state.customerName || '');
+      state.customerPhone = normalizedPhone(toolArgs.customer.phone || state.customerPhone || state.callerPhone || '');
+      state.customerEmail = normalizedEmail(toolArgs.customer.email || state.customerEmail || '');
+      if (state.customerPhone === state.callerPhone) state.confirmedPhone = state.customerPhone;
+      pushInternalCallContext(state, customerContinuityInstruction(state));
+    }
+
+    if (name === 'nbb_prepare_booking' && result?.review_token) {
+      state.lastReviewToken = String(result.review_token);
+      state.preparedAt = Date.now();
+      state.bookingConfirmationAt = 0;
+      state.awaitingBookingConfirmation = true;
+    }
+    if (name === 'nbb_commit_booking' && result?.booking_id) {
+      state.lastReviewToken = '';
+      state.preparedAt = 0;
+      state.bookingConfirmationAt = 0;
+      state.awaitingBookingConfirmation = false;
+      state.bookingWrapupRequired = true;
+      state.bookingWrapupRetryCount = 0;
+    }
+    if (name === 'nbb_request_callback' && result?.sent) {
+      state.callbackWrapupRequired = true;
+      state.callbackWrapupRetryCount = 0;
+    }
+    if (name === 'nbb_send_sms') state.smsRequestAt = 0;
+    if (name === 'nbb_send_email') state.emailRequestAt = 0;
+    if (name === 'nbb_send_estimate') {
+      const delivery = normalizeEstimateDelivery(result?.delivery || toolArgs?.delivery || state.estimateDeliveryPreference || '');
+      const estimateId = String(result?.estimate_id || toolArgs?.existing_estimate_id || '').trim();
+      if (delivery) {
+        state.estimateDeliveryPreference = delivery;
+        state.estimateDeliverySelectedAt = Date.now();
+        state.estimateSentAt = Date.now();
+        state.estimateSentDelivery = delivery;
+      }
+      if (estimateId) {
+        state.lastEstimateId = estimateId;
+        state.lastEstimateSignature = estimatePayloadSignature(toolArgs);
+      }
+      if (delivery === 'sms' || delivery === 'both') {
+        state.smsRequestAt = 0;
+        if (state.customerPhone) state.confirmedPhone = state.customerPhone;
+      }
+      if (delivery === 'email' || delivery === 'both') {
+        state.emailRequestAt = 0;
+        if (state.customerEmail) state.confirmedEmail = state.customerEmail;
+      }
+      pushInternalCallContext(
+        state,
+        `Estimate ${estimateId ? '#' + estimateId + ' ' : ''}delivery completed using ${estimateDeliveryLabel(delivery)}. If the caller asks to resend or changes only the delivery channel, call nbb_send_estimate again with the SAME quote details and the caller's CURRENT channel; Relay will resend this same estimate instead of creating a duplicate.`
+      );
+    }
+
+    reportVoiceEvent(state, {
+      kind: 'diagnostic',
+      event: 'voice_tool_complete',
+      tool_name: name,
+      tool_phase: 'complete',
+      duration_ms: durationMs,
+      booking_id: name === 'nbb_commit_booking' ? String(result?.booking_id || '') : '',
+      estimate_id: name === 'nbb_send_estimate' ? String(result?.estimate_id || '') : '',
+      customer_name: String(state.customerName || ''),
+      customer_phone: String(state.customerPhone || ''),
+      customer_email: String(state.customerEmail || ''),
+    });
+
+    acknowledgeFunction(state, callId, { success: true, data: result });
+    requestModelResponse(
+      state,
+      afterToolResponseInstructions(state, name, result),
+      'after_tool',
+      true
+    );
+  } catch (error) {
+    clearTimeout(progressTimer);
+    if (callId) state.toolProgressTimers.delete(callId);
+    const durationMs = Date.now() - startedAt;
+
+    if (name === 'nbb_get_quote' && ['nbb_voice_quotes_disabled', 'geovee_voice_capability_disabled'].includes(String(error?.code || ''))) {
+      state.rules.quotes_enabled = false;
+    }
+
+    reportVoiceEvent(state, {
+      kind: 'diagnostic',
+      event: 'voice_tool_failed',
+      tool_name: name,
+      tool_phase: 'failed',
+      duration_ms: durationMs,
+      diagnostic_message: String(error?.code || error?.message || 'nbb_tool_failed'),
+    });
+
+    acknowledgeFunction(state, callId, {
+      success: false,
+      code: error?.code || 'nbb_tool_failed',
+      message: error?.message || 'Nearby Booker tool failed',
+    });
+    const failureInstructions = name === 'nbb_get_quote' && state.rules?.quotes_enabled === false
+      ? 'Do not mention pricing settings or say pricing is disabled. Continue gathering the quote details and offer to send the real estimate by text, email, or both using nbb_send_estimate.'
+      : (name === 'nbb_send_estimate'
+        ? 'The real Nearby Booker estimate was NOT confirmed as sent. Do not claim it was sent. Briefly explain the specific customer-facing problem from the tool result, then ask for the one missing or corrected item needed to create and send the estimate. Never mention internal tools, review tokens, configuration, or pricing visibility.'
+        : (name === 'nbb_request_callback'
+          ? 'The callback request was NOT confirmed as sent. Do not claim someone will call back. Briefly explain that the request could not be submitted and ask only for any corrected callback detail the tool says is needed.'
+          : 'The Nearby Booker tool failed. Briefly explain that the requested check or action could not be completed, do not invent a result, and continue by asking for the one missing or corrected piece of information needed next.'));
+    requestModelResponse(
+      state,
+      failureInstructions,
+      'after_tool',
+      true
+    );
+  }
+}
+
+async function handleFunctionCall(state, name, callId, args = {}) {
+  // A function call is itself valid model continuation. Stop any no-audio
+  // watchdog from the prior response; this tool's progress timer now owns
+  // caller-facing dead-air handling until the function result returns.
+  clearContinuationWatchdog(state);
+  state.continuationRetryCount = 0;
+  if (callId && state.handledFunctionCalls.has(callId)) return;
+  if (callId) state.handledFunctionCalls.add(callId);
+  if (name === 'request_human_transfer') {
+    if (!state.rules?.human_transfer_enabled) {
+      acknowledgeFunction(state, callId, { success: false, reason: 'transfer_disabled' });
+      requestModelResponse(state, 'Briefly explain that human transfer is unavailable and offer to continue helping.', 'transfer_disabled', true);
+      return;
+    }
+    acknowledgeFunction(state, callId, { success: true, action: 'transferring' });
+    await executeTransfer(state, 'human_request', 'model_tool');
+    return;
+  }
+  if (name === 'report_priority_issue') {
+    if (state.rules?.emergency_enabled && state.rules?.emergency_action === 'transfer') {
+      acknowledgeFunction(state, callId, { success: true, action: 'transferring' });
+      await executeTransfer(state, 'emergency', 'model_tool');
+    } else {
+      acknowledgeFunction(state, callId, { success: true, action: 'continue_and_collect_callback' });
+      if (state.rules?.callback_enabled) {
+        requestModelResponse(state, 'Collect a brief callback reason and customer name if needed, reuse the verified caller number unless they explicitly provide a different confirmed number, then call nbb_request_callback. Do not claim the callback was submitted until that tool returns success.', 'priority_continue', true);
+      } else {
+        requestModelResponse(state, 'Briefly explain that a callback request cannot be submitted right now and continue helping with any safe question you can answer.', 'priority_continue', true);
+      }
+    }
+    return;
+  }
+  if (String(name || '').startsWith('nbb_')) {
+    await executeNbbTool(state, name, callId, args);
+    return;
+  }
+  acknowledgeFunction(state, callId, { success: false, code: 'unknown_tool', message: 'This Voice tool is not supported by the Relay.' });
+  requestModelResponse(state, 'Briefly explain that the requested phone action is unavailable and continue helping.', 'unknown_tool', true);
+}
+
+function handleOpenAIEvent(state, raw) {
+  let event;
+  try { event = JSON.parse(raw.toString()); } catch { return; }
+  const type = String(event?.type || '');
+
+  if (type === 'response.created') {
+    state.responseActive = true;
+    state.responseRequestPending = false;
+    return;
+  }
+
+  // GA event is response.output_audio.delta. Accept the older alias defensively during API transitions.
+  if ((type === 'response.output_audio.delta' || type === 'response.audio.delta') && event.delta) {
+    clearContinuationWatchdog(state);
+    state.continuationRetryCount = 0;
+    if (state.startupAudioGate) {
+      state.startupAudioGate = false;
+      state.greetingAudioStarted = true;
+      log('info', 'Opening greeting audio started; caller audio gate opened', {
+        callSid: state.callSid,
+        droppedStartupAudioFrames: state.droppedStartupAudioFrames,
+      });
+      reportVoiceEvent(state, {
+        kind: 'diagnostic',
+        event: 'voice_opening_greeting_started',
+        realtime_event: type,
+        diagnostic_message: `Opening greeting audio began; ${state.droppedStartupAudioFrames} startup caller-audio frames were suppressed.`,
+      });
+    }
+    safeSend(state.twilioWs, { event: 'media', streamSid: state.streamSid, media: { payload: event.delta } });
+    return;
+  }
+
+  // Store customer text only in the tenant's NBB transcript store when that tenant opted in.
+  if (type === 'conversation.item.input_audio_transcription.completed') {
+    const transcript = String(event.transcript || '').trim();
+    if (transcript) {
+      const normalized = normalizedText(transcript);
+      const asksSms = asksForTextMessage(transcript);
+      const asksEmail = asksForEmailMessage(transcript);
+      if (asksSms || normalized === 'both') state.smsRequestAt = Date.now();
+      if (asksEmail || normalized === 'both') state.emailRequestAt = Date.now();
+
+      // Transcript parsing may establish the FIRST clear delivery choice, but it
+      // never overrides an existing choice. Later changes are committed from the
+      // normalized nbb_send_estimate tool argument, which is estimate-specific and
+      // avoids brittle phrase rules such as requiring "switch" or "instead".
+      const explicitDelivery = normalized === 'both' ? 'both' : explicitEstimateDeliveryChoice(transcript);
+      if (!state.estimateDeliveryPreference && explicitDelivery) {
+        state.estimateDeliveryPreference = explicitDelivery;
+        state.estimateDeliverySelectedAt = Date.now();
+      }
+
+      state.conversationMessages.push({ role: 'user', content: transcript });
+      if (state.conversationMessages.length > 40) state.conversationMessages = state.conversationMessages.slice(-40);
+      reportVoiceEvent(state, {
+        kind: 'message',
+        role: 'user',
+        content: transcript,
+        event: 'voice_customer_message',
+      });
+    }
+
+    if (state.pendingContactConfirmation) {
+      const pending = state.pendingContactConfirmation;
+      if (isAffirmativeBookingConfirmation(transcript)) {
+        if (pending.type === 'email') {
+          state.customerEmail = normalizedEmail(pending.value);
+          state.confirmedEmail = state.customerEmail;
+        } else if (pending.type === 'phone') {
+          state.customerPhone = normalizedPhone(pending.value);
+          state.confirmedPhone = state.customerPhone;
+        }
+        state.pendingContactConfirmation = null;
+        pushInternalCallContext(state, `The caller explicitly confirmed the ${pending.type} ${pending.value}. This value is now locked for the call. Continue the pending estimate/booking flow using that exact value without asking again, even if a later model retry proposes a different spelling.`);
+      } else if (isNegativeBookingConfirmation(transcript)) {
+        state.pendingContactConfirmation = null;
+        if (pending.type === 'email') { state.customerEmail = ''; state.confirmedEmail = ''; }
+        if (pending.type === 'phone') { state.confirmedPhone = ''; }
+        pushInternalCallContext(state, `The caller rejected the previously captured ${pending.type}. Ask only for the corrected ${pending.type} next; do not reuse the rejected value.`);
+      }
+    }
+
+    if (state.awaitingBookingConfirmation) {
+      if (isAffirmativeBookingConfirmation(transcript)) {
+        state.bookingConfirmationAt = Date.now();
+      } else if (isNegativeBookingConfirmation(transcript)) {
+        state.bookingConfirmationAt = 0;
+      }
+    }
+    if (!state.transferInProgress && state.rules?.human_transfer_enabled && asksForHuman(transcript)) {
+      executeTransfer(state, 'human_request', 'deterministic_transcript_rule');
+      return;
+    }
+    if (!state.transferInProgress && state.rules?.emergency_enabled && matchesTenantPriority(transcript, state.rules?.emergency_keywords || [])) {
+      if (state.rules?.emergency_action === 'transfer') executeTransfer(state, 'emergency', 'deterministic_transcript_rule');
+    }
+    return;
+  }
+
+  // Store the spoken AI text, never the audio, and never write the transcript to Render logs.
+  if (type === 'response.output_audio_transcript.done' || type === 'response.audio_transcript.done') {
+    const transcript = String(event.transcript || '').trim();
+    if (transcript) {
+      state.conversationMessages.push({ role: 'assistant', content: transcript });
+      if (state.conversationMessages.length > 40) state.conversationMessages = state.conversationMessages.slice(-40);
+      reportVoiceEvent(state, {
+        kind: 'message',
+        role: 'assistant',
+        content: transcript,
+        event: 'voice_agent_message',
+      });
+      if (state.bookingWrapupRequired && bookingWrapupSatisfied(transcript)) {
+        state.bookingWrapupRequired = false;
+      }
+      if (state.callbackWrapupRequired) {
+        const t = normalizedText(transcript);
+        const closed = (t.includes('callback') || t.includes('call you back') || t.includes('request')) &&
+          (t.includes('thank') || t.includes('goodbye') || t.includes('good bye') || t.includes('have a great'));
+        if (closed) state.callbackWrapupRequired = false;
+      }
+    }
+    return;
+  }
+
+  if (type === 'input_audio_buffer.speech_started') {
+    // Startup caller audio is deliberately suppressed until greeting audio starts,
+    // so a stale/early VAD event must never clear the deterministic greeting.
+    if (state.startupAudioGate) return;
+    // A real caller turn takes precedence over a dead-air retry.
+    clearContinuationWatchdog(state);
+    state.continuationRetryCount = 0;
+    // Twilio buffers outbound media. Clear it immediately so barge-in feels real.
+    if (state.rules?.barge_in_enabled) safeSend(state.twilioWs, { event: 'clear', streamSid: state.streamSid });
+    return;
+  }
+
+  if (type === 'response.function_call_arguments.delta' && event.call_id) {
+    const prior = state.pendingFunctionArgs.get(event.call_id) || { name: event.name || '', args: '' };
+    prior.name = prior.name || event.name || '';
+    prior.args += String(event.delta || '');
+    state.pendingFunctionArgs.set(event.call_id, prior);
+    return;
+  }
+
+  if (type === 'response.function_call_arguments.done') {
+    const prior = state.pendingFunctionArgs.get(event.call_id) || {};
+    const name = String(event.name || prior.name || '');
+    const argText = String(event.arguments || prior.args || '{}');
+    // GA function-argument events may omit the function name. Keep the final
+    // arguments until response.output_item.done supplies the authoritative name.
+    state.pendingFunctionArgs.set(event.call_id, { name, args: argText });
+    if (name) {
+      let args = {};
+      try { args = JSON.parse(argText || '{}'); } catch {}
+      state.pendingFunctionArgs.delete(event.call_id);
+      handleFunctionCall(state, name, event.call_id, args);
+    }
+    return;
+  }
+
+  // Completed output item is the authoritative source for function name/call id.
+  if (type === 'response.output_item.done' && event.item?.type === 'function_call') {
+    const callId = String(event.item.call_id || '');
+    const prior = state.pendingFunctionArgs.get(callId) || {};
+    const argText = String(event.item.arguments || prior.args || '{}');
+    let args = {};
+    try { args = JSON.parse(argText || '{}'); } catch {}
+    state.pendingFunctionArgs.delete(callId);
+    handleFunctionCall(state, String(event.item.name || prior.name || ''), callId, args);
+    return;
+  }
+
+  if (type === 'response.done' || type === 'response.cancelled' || type === 'response.failed') {
+    state.responseActive = false;
+    state.responseRequestPending = false;
+    if (type === 'response.failed') {
+      reportVoiceEvent(state, {
+        kind: 'diagnostic',
+        event: 'voice_realtime_response_failed',
+        realtime_event: type,
+        diagnostic_message: String(event?.response?.status_details?.error?.code || event?.response?.status_details?.error?.message || 'Realtime response failed.'),
+      });
+    }
+    if (state.queuedResponseInstructions || state.queuedResponseReason) {
+      flushQueuedResponse(state);
+      return;
+    }
+    if (type === 'response.done' && state.bookingWrapupRequired && state.bookingWrapupRetryCount < 1) {
+      state.bookingWrapupRetryCount += 1;
+      setTimeout(() => requestModelResponse(
+        state,
+        `The booking already succeeded. The previous response did not include a complete closing. Say one brief final wrap-up now: repeat the appointment status/window if useful, explicitly say "You're all set", explain that approval/confirmation will follow if applicable, thank the caller for calling ${state.businessName || 'the business'}, and say goodbye. Do not ask another question.`,
+        'booking_wrapup_retry',
+        true
+      ), 75);
+      return;
+    }
+    if (type === 'response.done' && state.callbackWrapupRequired && state.callbackWrapupRetryCount < 1) {
+      state.callbackWrapupRetryCount += 1;
+      setTimeout(() => requestModelResponse(
+        state,
+        `The callback request already succeeded. Say one brief final closing now: tell the caller the callback request was sent to ${state.businessName || 'the business'}, thank them for calling, and say goodbye. Do not ask another question and do not promise a callback time.`,
+        'callback_wrapup_retry',
+        true
+      ), 75);
+      return;
+    }
+    flushQueuedResponse(state);
+    return;
+  }
+
+  if (type === 'error') {
+    const code = String(event?.error?.code || 'realtime_error');
+    const errorType = String(event?.error?.type || '');
+    log('warn', 'OpenAI Realtime returned an error event', { callSid: state.callSid, code, type: errorType });
+    reportVoiceEvent(state, {
+      kind: 'diagnostic',
+      event: 'voice_realtime_error',
+      realtime_event: type,
+      diagnostic_message: `${code}${errorType ? ` (${errorType})` : ''}`,
+    });
+  }
+}
+async function finishSession(state, disposition = 'ended') {
+  if (state.ended) return;
+  clearContinuationWatchdog(state);
+  for (const timer of state.toolProgressTimers.values()) clearTimeout(timer);
+  state.toolProgressTimers.clear();
+  state.ended = true;
+  if (state.maxTimer) clearTimeout(state.maxTimer);
+  const durationSeconds = Math.max(0, Math.round((Date.now() - state.startedAt) / 1000));
+  if (state.openaiWs && (state.openaiWs.readyState === WebSocket.OPEN || state.openaiWs.readyState === WebSocket.CONNECTING)) {
+    try { state.openaiWs.close(1000, 'Twilio stream ended'); } catch {}
+  }
+  if (state.sessionId) {
+    // Give already-queued transcript writes a brief chance to land before the
+    // Proxy destroys the live Voice session used to authenticate them.
+    try {
+      await Promise.race([
+        state.transcriptChain || Promise.resolve(),
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]);
+    } catch {}
+    try { await proxyPost('/session/end', { session_id: state.sessionId, duration_seconds: durationSeconds, disposition }); }
+    catch (error) { log('warn', 'Could not report Voice session end', { callSid: state.callSid, error: error?.message || 'end_report_failed' }); }
+  }
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.11' }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+});
+
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (request, socket, head) => {
+  const path = new URL(request.url || '/', 'http://localhost').pathname;
+  if (path !== '/twilio/media') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
+});
+
+wss.on('connection', (twilioWs) => {
+  const state = createConnectionState(twilioWs);
+  log('info', 'Twilio Media Stream connected');
+
+  twilioWs.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.event === 'start') {
+      state.streamSid = String(msg.start?.streamSid || msg.streamSid || '');
+      state.callSid = String(msg.start?.callSid || '');
+      const sessionToken = String(msg.start?.customParameters?.session_token || '');
+      if (!state.streamSid || !sessionToken) {
+        log('error', 'Twilio start event missing stream/session token', { callSid: state.callSid });
+        twilioWs.close(1008, 'Missing session token');
+        return;
+      }
+      try { await beginOpenAI(state, sessionToken); }
+      catch (error) {
+        log('error', 'Voice bootstrap failed', { callSid: state.callSid, error: error?.message || 'bootstrap_failed', code: error?.code || '' });
+        twilioWs.close(1011, 'Voice bootstrap failed');
+      }
+      return;
+    }
+    if (msg.event === 'media' && msg.media?.payload) {
+      // Do not let pre-greeting speech/background noise race the deterministic
+      // opening. Once the first greeting audio frame is emitted, normal caller
+      // audio and barge-in behavior resume immediately.
+      if (state.startupAudioGate) {
+        state.droppedStartupAudioFrames += 1;
+        return;
+      }
+      if (state.openaiWs?.readyState === WebSocket.OPEN) safeSend(state.openaiWs, { type: 'input_audio_buffer.append', audio: msg.media.payload });
+      else if (state.pendingAudio.length < 500) state.pendingAudio.push(msg.media.payload);
+      return;
+    }
+    if (msg.event === 'stop') {
+      await finishSession(state, state.transferInProgress ? 'transferred' : 'twilio_stop');
+    }
+  });
+
+  twilioWs.on('close', () => finishSession(state, state.transferInProgress ? 'transferred' : 'socket_closed'));
+  twilioWs.on('error', (error) => {
+    log('warn', 'Twilio Media Stream socket error', { callSid: state.callSid, error: error?.message || 'socket_error' });
+  });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  log('info', 'Nearby Booker Voice Relay started', { port: PORT, websocketPath: '/twilio/media' });
+});
