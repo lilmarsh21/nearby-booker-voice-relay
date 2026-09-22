@@ -1,0 +1,12 @@
+Nearby Booker Voice Relay v0.2.30 — Workflow Intent Lock
+
+Base: v0.2.29 Voice Booking Notes Toggle
+
+Changes:
+- Added persistent call-goal state for booking, estimate, reschedule, and cancellation intent.
+- A caller who explicitly asks to schedule/book remains in the booking flow across service-detail questions and tool results.
+- A pricing/estimate question during booking is treated as a side request unless the caller explicitly switches to estimate-only.
+- Prevents proactive nbb_get_quote / nbb_send_estimate calls from replacing an active booking goal.
+- Added a hard wait gate after the deterministic "Would you like to add any other services?" checkpoint so tool/retry loops cannot ask the same question twice before the caller answers.
+- Post-service continuation now follows the locked call goal instead of falling into a generic quote path.
+- No service-specific or dryer-vent-specific logic was added.
