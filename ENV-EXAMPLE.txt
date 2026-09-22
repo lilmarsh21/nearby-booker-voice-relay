@@ -1,5 +1,0 @@
-PORT=8080
-GEOVEE_PROXY_VOICE_BASE_URL=https://sub.geovee.io/wp-json/geovee/v1/voice
-GEOVEE_VOICE_RELAY_SECRET=copy-from-GeoVee-Proxy-Voice-AI-settings
-OPENAI_REALTIME_WS_BASE=wss://api.openai.com/v1/realtime
-LOG_LEVEL=info
