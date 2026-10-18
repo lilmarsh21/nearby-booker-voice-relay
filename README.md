@@ -1,4 +1,4 @@
-# Nearby Booker Voice Relay v0.2.40
+# Nearby Booker Voice Relay v0.2.41
 
 This is the **standalone, isolated realtime media service** for Nearby Booker Phone AI.
 
@@ -71,3 +71,6 @@ This package preserves the audited v0.1.1 relay behavior and HMAC request contra
 - Do not add any booking tools or historical-invoice lookup paths in this release. Repeat-booking history still needs tenant-side and authenticated Proxy tool integration and customer verification.
 - This protects Voice AI conversation intent **only**. The website chatbot uses separate NBB conversational logic and must be repaired/tested independently.
 - No changes to Twilio signaling, transfer, approval, reminder, winback, calendar, existing-tool routing, or pricing policies.
+
+## v0.2.41 pending-tool silence guard (2026-10-18)
+The idle-call watchdog cannot terminate an active Nearby Booker tool request. It restarts the normal silence window only after the tool finishes. The original idle-call setting and all Twilio call routing remain unchanged.

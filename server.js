@@ -1100,6 +1100,7 @@ function createConnectionState(twilioWs) {
     lastSpokenActivityAt: 0,
     silenceTimer: null,
     silenceHangupInProgress: false,
+    activeNbbToolCount: 0, // Pending server-side tools are not caller inactivity.
     autoNoiseFloorRms: 0,
     autoRecentRms: [],
     autoSpeechStartedAt: 0,
@@ -1494,7 +1495,7 @@ function armSilenceHangupFromLastActivity(state) {
   clearSilenceHangupTimer(state);
   if (state.messageMode) return;
   if (state.ended || state.silenceHangupInProgress || state.startupAudioGate || !state.lastSpokenActivityAt) return;
-  if (state.callerSpeechActive || state.aiAudioActive || state.aiPlaybackPending) return;
+  if (state.callerSpeechActive || state.aiAudioActive || state.aiPlaybackPending || state.activeNbbToolCount > 0) return;
   const seconds = silenceHangupSeconds(state);
   const elapsed = Date.now() - state.lastSpokenActivityAt;
   const remaining = Math.max(50, (seconds * 1000) - elapsed);
@@ -1508,7 +1509,7 @@ function markSpokenActivity(state, keepPaused = false) {
 }
 
 async function executeSilenceHangup(state) {
-  if (state.ended || state.silenceHangupInProgress || state.callerSpeechActive || state.aiAudioActive || state.aiPlaybackPending) {
+  if (state.ended || state.silenceHangupInProgress || state.callerSpeechActive || state.aiAudioActive || state.aiPlaybackPending || state.activeNbbToolCount > 0) {
     armSilenceHangupFromLastActivity(state);
     return;
   }
@@ -2511,6 +2512,9 @@ async function executeNbbTool(state, name, callId, args = {}) {
     }));
   }
 
+  // Pause the idle hangup while the server performs an authenticated NBB tool request.
+  state.activeNbbToolCount = (state.activeNbbToolCount || 0) + 1;
+  clearSilenceHangupTimer(state);
   const startedAt = Date.now();
   reportVoiceEvent(state, {
     kind: 'diagnostic',
@@ -2708,6 +2712,11 @@ async function executeNbbTool(state, name, callId, args = {}) {
       'after_tool',
       true
     );
+  } finally {
+    state.activeNbbToolCount = Math.max(0, (state.activeNbbToolCount || 0) - 1);
+    // Tool time is not caller inactivity. Resume original idle timeout only
+    // after the final pending tool settles (success OR failure).
+    if (state.activeNbbToolCount === 0 && !state.ended) markSpokenActivity(state);
   }
 }
 
@@ -3246,7 +3255,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.40' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.41' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
