@@ -1,0 +1,6 @@
+Nearby Booker Voice Relay v0.2.40
+Base: uploaded GitHub relay v0.2.39
+Targeted change: booking goal detection now recognizes appointment availability requests, with lock against repeated estimate-or-availability choice.
+Scope: conversation intent parsing/instruction only; no Proxy endpoints, tools, or booking writes changed.
+Important: This alone DOES NOT fix the website chatbot transcript. NBB .71 repeat history is a foundation only; Voice repeat booking still needs authenticated Proxy and tenant integrations.
+Rollout: do not deploy to live Render without confirming which GitHub commit and version Render currently uses. Test on isolated deployment before promotion.

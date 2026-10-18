@@ -744,6 +744,15 @@ function explicitWorkflowIntent(text) {
     /\b(?:can|could|would) (?:i|we)\b.*\b(?:schedule|book)\b/,
     /\b(?:ready|want|need) to (?:schedule|book)\b/,
     /\b(?:schedule|book)\s+(?:it|this|that|the estimate|the quote)\b/,
+    // v0.2.40: the customer may choose the booking path by asking for
+    // appointment availability rather than using the words "book"/"schedule".
+    // Keep this narrow to time-slot requests; a generic service-hours question
+    // must not silently start an appointment.
+    /\b(?:appointment|booking|service)\s+availability\b/,
+    /\bavailability\s+(?:please|for\s+(?:an?\s+)?appointment|for\s+(?:cleaning|service|job)|to\s+(?:schedule|book))\b/,
+    /\b(?:check|see|show|find|look\s+(?:up|for)|tell\s+me|give\s+me)\b.{0,90}\b(?:availability|available\s+(?:dates?|times?|slots?|appointments?)|open\s+(?:dates?|times?|slots?|appointments?))\b/,
+    /\b(?:what|which)\s+(?:dates?|times?|slots?|appointments?)\s+(?:are|do\s+you\s+have)\s+(?:available|open)\b/,
+    /\bwhen\s+(?:can|could)\s+(?:you|we|i)\s+(?:come|schedule|book|visit|fit\s+me\s+in)\b/,
   ].some((pattern) => pattern.test(t));
   if (booking) return 'booking';
 
@@ -771,7 +780,7 @@ function explicitlySwitchesToEstimateOnly(text) {
 function workflowIntentInstruction(state) {
   const goal = String(state.workflowIntent || '');
   if (goal === 'booking') {
-    return 'CALL GOAL IS LOCKED TO BOOKING/SCHEDULING because the caller explicitly asked to make an appointment. Keep that goal across service-detail questions and tool results. A price/quote question may be answered as a side request, but it does NOT replace the booking goal unless the caller explicitly says they only want an estimate instead. After service collection is complete, continue the booking path: service address, live availability, slot selection, required contact details, optional configured notes checkpoint, booking review, explicit confirmation, then submission. Do not proactively switch into estimate-delivery mode.';
+    return 'CALL GOAL IS LOCKED TO BOOKING/SCHEDULING because the caller explicitly asked to book or check appointment availability. The caller already chose scheduling: do not ask them to choose between an estimate and availability again. Keep that goal across service-detail questions and tool results. A price/quote question may be answered as a side request, but it does NOT replace the booking goal unless the caller explicitly says they only want an estimate instead. After service collection is complete, continue the booking path: service address, live availability, slot selection, required contact details, optional configured notes checkpoint, booking review, explicit confirmation, then submission. If the existing address or services are missing, ask only for the missing required detail before checking availability. Do not proactively switch into estimate-delivery mode.';
   }
   if (goal === 'estimate') {
     return 'CALL GOAL IS LOCKED TO QUOTE/ESTIMATE. Complete the estimate workflow and do not start availability or booking unless the caller explicitly asks to schedule/book.';
@@ -3237,7 +3246,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.39' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.40' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });

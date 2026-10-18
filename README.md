@@ -1,10 +1,10 @@
-# Nearby Booker Voice Relay v0.1.2 — Phase 1 Current-Base Port
+# Nearby Booker Voice Relay v0.2.40
 
 This is the **standalone, isolated realtime media service** for Nearby Booker Phone AI.
 
 It does not contain Nearby Booker scheduling logic and it does not store Twilio or OpenAI permanent credentials. Twilio calls enter through the GeoVee Proxy Voice endpoint first; the Proxy validates Twilio, identifies the tenant, and issues a one-time session token. The Relay then requests a short-lived OpenAI Realtime client secret from the Proxy.
 
-## Phase 1 scope
+## Historical notes and scope
 
 - Real inbound phone call via Twilio bidirectional Media Streams.
 - Direct PCMU / G.711 μ-law audio bridge between Twilio and OpenAI Realtime; no transcoding.
@@ -15,7 +15,7 @@ It does not contain Nearby Booker scheduling logic and it does not store Twilio 
 - Tenant-defined priority/emergency phrase rule.
 - Controlled human transfer through the Proxy/Twilio Call API.
 - Call duration/status metadata reporting.
-- **No booking, reschedule, cancel, pricing, availability, Google Calendar, Radius/Offers, or Team Calendar write tools.**
+- Booking, rescheduling, availability and other tenant tools are mediated by the authenticated Proxy/NBB integrations; the relay does not contain scheduling or invoice storage.
 
 ## Requirements
 
@@ -63,3 +63,11 @@ Historical note: v0.1.1 was originally paired with GeoVee Proxy v1.3.51. It repl
 ## v0.1.2 current-base port
 
 This package preserves the audited v0.1.1 relay behavior and HMAC request contract while pairing it with the current production-line Voice port: NBB v1.38.299.3.7 and GeoVee Proxy v1.3.49.2.3. No scheduling, booking, pricing, availability, or tenant business logic is added to the Relay.
+
+## v0.2.40 targeted change (2026-10-17)
+
+- Recognize an explicit request to **check appointment availability** as a booking goal even without the word "book" or "schedule".
+- Preserve that goal and do not ask "estimate or availability" again after the customer chose availability.
+- Do not add any booking tools or historical-invoice lookup paths in this release. Repeat-booking history still needs tenant-side and authenticated Proxy tool integration and customer verification.
+- This protects Voice AI conversation intent **only**. The website chatbot uses separate NBB conversational logic and must be repaired/tested independently.
+- No changes to Twilio signaling, transfer, approval, reminder, winback, calendar, existing-tool routing, or pricing policies.
