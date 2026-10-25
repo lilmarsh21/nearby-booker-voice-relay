@@ -928,7 +928,9 @@ function isAdditionalServiceQuestion(text) {
     'add any other service', 'add any other services', 'add another service',
     'any other service', 'any other services', 'anything else you would like cleaned',
     'anything else youd like cleaned', 'anything else you want cleaned',
-    'would you like anything else', 'do you need anything else cleaned'
+    'would you like anything else', 'do you need anything else cleaned',
+    'what other service would you like to add', 'what other services would you like to add',
+    'is that everything you want cleaned', 'is that everything you want'
   ];
   return asks.some((phrase) => t.includes(phrase));
 }
@@ -1775,7 +1777,11 @@ function afterToolResponseInstructions(state, name, result) {
   }
 
   if (name === 'nbb_validate_address' && result && typeof result === 'object') {
-    parts.push('The address check just completed. If Nearby Booker accepted/canonicalized the address, do NOT say technical phrases such as address validation succeeded, eligible to continue, validation result, or confirmation policy. Acknowledge naturally in a few words and CONTINUE THE SCHEDULING FLOW IN THIS SAME TURN. If the caller has not yet supplied the configured service selections/quantities needed for availability, ask exactly one concise service question next. If the required services/quantities are already known from the conversation, call nbb_get_availability immediately using the validated address. Never end this turn with only a status statement after a successful address check. If the address was rejected or materially incomplete, ask only for the missing/corrected address information.');
+    if (state.serviceCollectionClosed && result.eligible_for_search) {
+      parts.push('ADDRESS ACCEPTED; SERVICE COLLECTION ALREADY CLOSED BY THE CALLER. Do not ask about additional services or end with an announcement. Immediately call nbb_get_availability with the verified address and already collected configured service quantities/variants, with no additional spoken question. If a REQUIRED variant or quantity is genuinely missing, ask only that precise missing detail; never ask whether they want other services.');
+    } else {
+      parts.push('The address check just completed. If Nearby Booker accepted/canonicalized the address, do NOT say technical phrases such as address validation succeeded, eligible to continue, validation result, or confirmation policy. Acknowledge naturally in a few words and CONTINUE THE SCHEDULING FLOW IN THIS SAME TURN. If the caller has not yet supplied the configured service selections/quantities needed for availability, ask exactly one concise service question next. If the required services/quantities are already known from the conversation, call nbb_get_availability immediately using the validated address. Never end this turn with only a status statement after a successful address check. If the address was rejected or materially incomplete, ask only for the missing/corrected address information.');
+    }
   }
 
   if (state.rules?.show_arrival_time && ['nbb_get_availability', 'nbb_prepare_booking', 'nbb_commit_booking'].includes(name)) {
@@ -2523,23 +2529,44 @@ async function executeNbbTool(state, name, callId, args = {}) {
     tool_phase: 'start',
   });
 
+  // v0.2.42: announce progress repeatedly for slow live-calendar calls, not
+  // just once. Never stack model responses or leave a deferred callback behind
+  // once the underlying tool settles. No synthetic availability is generated.
   const progressDelay = Math.max(4, Math.min(20, Number(state.rules?.dead_air_seconds || 7))) * 1000;
-  const speakToolProgress = () => {
-    if (state.ended) return;
-    if (state.callerSpeechActive) {
-      const deferred = setTimeout(speakToolProgress, 400);
-      if (callId) state.toolProgressTimers.set(callId, deferred);
-      return;
-    }
-    requestModelResponse(
-      state,
-      'Say one short sentence that you are still checking that information. Do not ask a question, do not claim a result, and do not mention technical details.',
-      'tool_progress',
-      false
-    );
+  const progressInterval = Math.max(9000, Math.min(12000, progressDelay));
+  const progressKey = callId || Symbol('nbb-tool-progress');
+  let progressTimer = null;
+  let progressSettled = false;
+  let progressCount = 0;
+  const scheduleToolProgress = (delay) => {
+    if (progressSettled || state.ended) return;
+    progressTimer = setTimeout(speakToolProgress, delay);
+    state.toolProgressTimers.set(progressKey, progressTimer);
   };
-  const progressTimer = setTimeout(speakToolProgress, progressDelay);
-  if (callId) state.toolProgressTimers.set(callId, progressTimer);
+  const stopToolProgress = () => {
+    progressSettled = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    state.toolProgressTimers.delete(progressKey);
+    // A progress message queued behind another response must not play after the
+    // actual availability/tool result has arrived.
+    if (state.queuedResponseReason === 'tool_progress') clearQueuedResponse(state);
+  };
+  const speakToolProgress = () => {
+    if (progressSettled || state.ended || state.activeNbbToolCount < 1) return;
+    // A caller utterance, active AI speech, or an in-flight response takes
+    // priority over a filler. We will recheck; no queued filler is left behind.
+    if (!state.callerSpeechActive && !state.responseActive && !state.responseRequestPending && !state.aiAudioActive && !state.aiPlaybackPending) {
+      const messages = [
+        'Say one brief natural sentence: "I’m still checking the available appointment times." Do not ask a question or claim a result.',
+        'Say one brief natural sentence: "This is taking a little longer than usual, but I’m still checking." Do not ask a question or claim a result.',
+        'Say one brief natural sentence: "I’m still working on those appointment options." Do not ask a question or claim a result.',
+      ];
+      requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
+      progressCount += 1;
+    }
+    scheduleToolProgress(progressInterval);
+  };
+  scheduleToolProgress(progressDelay);
 
   try {
     const response = await proxyPost('/tool', {
@@ -2547,8 +2574,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
       tool_name: name,
       arguments: toolArgs,
     });
-    clearTimeout(progressTimer);
-    if (callId) state.toolProgressTimers.delete(callId);
+    stopToolProgress();
 
     let result = response?.result ?? {};
     if (name === 'nbb_get_availability') result = sortVoiceAvailabilityResult(result);
@@ -2677,8 +2703,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
       true
     );
   } catch (error) {
-    clearTimeout(progressTimer);
-    if (callId) state.toolProgressTimers.delete(callId);
+    stopToolProgress();
     const durationMs = Date.now() - startedAt;
 
     if (name === 'nbb_get_quote' && ['nbb_voice_quotes_disabled', 'geovee_voice_capability_disabled'].includes(String(error?.code || ''))) {
@@ -2713,6 +2738,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
       true
     );
   } finally {
+    stopToolProgress();
     state.activeNbbToolCount = Math.max(0, (state.activeNbbToolCount || 0) - 1);
     // Tool time is not caller inactivity. Resume original idle timeout only
     // after the final pending tool settles (success OR failure).
@@ -2896,6 +2922,24 @@ function handleOpenAIEvent(state, raw) {
         );
         return;
       }
+    }
+
+    // The caller can close service collection in natural speech even when a
+    // spontaneous Realtime response (not a deterministic tool checkpoint) asked
+    // the question. Require the most recent AI utterance to be a service-addition
+    // question, so a generic "no" to an unrelated contact question cannot close
+    // service collection accidentally.
+    const latestAssistantMessage = [...state.conversationMessages].reverse().find((row) => row?.role === 'assistant');
+    const justAskedAdditionalServices = isAdditionalServiceQuestion(latestAssistantMessage?.content || '');
+    if (!state.serviceCollectionClosed
+        && (state.awaitingAdditionalServiceDecision || justAskedAdditionalServices)
+        && isNoMoreServicesReply(transcript)) {
+      state.awaitingAdditionalServiceDecision = false;
+      state.serviceCollectionClosed = true;
+      const nextInstruction = postServiceContinuationInstruction(state);
+      pushInternalCallContext(state, nextInstruction);
+      queueDeterministicContinuation(state, nextInstruction, 'service_collection_closed_continue');
+      return;
     }
 
     if (state.awaitingAdditionalServiceDecision) {

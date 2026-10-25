@@ -1,0 +1,3 @@
+Relay v0.2.42 | Base: user-uploaded main branch v0.2.41
+Scope: progress reminders for slow tools, proper timer cleanup, additional-service closure robustness, address-validation continuation.
+No NBB/Proxy modifications, no scheduling eligibility changes. Test on staging before Render production.

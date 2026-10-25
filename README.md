@@ -1,4 +1,4 @@
-# Nearby Booker Voice Relay v0.2.41
+# Nearby Booker Voice Relay v0.2.42
 
 This is the **standalone, isolated realtime media service** for Nearby Booker Phone AI.
 
@@ -74,3 +74,10 @@ This package preserves the audited v0.1.1 relay behavior and HMAC request contra
 
 ## v0.2.41 pending-tool silence guard (2026-10-18)
 The idle-call watchdog cannot terminate an active Nearby Booker tool request. It restarts the normal silence window only after the tool finishes. The original idle-call setting and all Twilio call routing remain unchanged.
+
+## v0.2.42 targeted voice-wait and service-state corrections (2026-10-25)
+
+- During long NBB tools, repeat short, truthful progress messages at a 9–12 second interval after the configured initial delay; avoid overlapping caller speech or active AI responses. Clear *all* tool progress timers on either success or failure, including speech-deferred timers.
+- Close the additional-services checkpoint for an explicit caller completion response to a recently spoken additional-services question, even when that question was generated without the deterministic tool gate.
+- After successfully validating an address, if the caller already closed service collection, tell the Realtime agent to proceed directly to availability instead of reopening the optional-service question.
+- Does not alter Proxy/NBB live-calendar searches, slot eligibility, pricing, booking writes, or Twilio routing. A 48-second availability lookup still requires NBB-side performance profiling.
