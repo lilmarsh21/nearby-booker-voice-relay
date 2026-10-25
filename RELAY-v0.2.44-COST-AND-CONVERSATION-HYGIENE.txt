@@ -1,0 +1,8 @@
+NearBy Booker Voice Relay v0.2.44 (FULL SOURCE) built from v0.2.43 -> .42 -> uploaded production-line v0.2.41.
+
+- Avoid spawning an expensive model-generated progress announcement during normal ~8–10 second availability checks. First progress at 12 seconds minimum, repeat every 12–15 seconds while tool actually running. Keep watchdog and interruption safety.
+- Shrink repetitive transient per-response workflow reminders while preserving key behavior: spoken pricing restrictions, confirmed email/phone, appointment notes, customer intent, service completion, arrival-time phrasing, and callback-only scope. These dynamic response instructions were re-sent on EVERY voice model response.
+- Preserve v0.2.42 repeated service/progress timer fixes and v0.2.43 one-confirmation/email/readback and explicit Submit improvements.
+- No model change, no unsafe history dropping, no automatic context truncation, no new diagnostics/dashboard, and no NBB/Proxy changes.
+- The original substantial session prompt and tool outputs still contribute to Realtime cost. This update targets avoidable overhead and follow-ups; it does not guarantee a cost reduction or replace an end-to-end deployment test.
+- Deploy to staging and validate service variants, book/reschedule/cancel, estimates, pricing-disabled behavior, contact confirmations, longer availability tool wait and human transfers.

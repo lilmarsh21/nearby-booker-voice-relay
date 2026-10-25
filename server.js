@@ -695,6 +695,26 @@ function confirmationIntent(text) {
   return null;
 }
 
+function isExplicitSubmitBookingApproval(text) {
+  // This is only consulted when a validated booking is waiting for final
+  // authorization. It must NOT count as consent to a different checkpoint.
+  const t = normalizedText(text);
+  return /^(?:submit|submit it|submit this|submit the appointment|please submit|please submit it|send the booking|send the appointment|go ahead and submit|go ahead submit|book this appointment|book the appointment|book it now)$/.test(t);
+}
+
+function emailFromAssistantConfirmation(text) {
+  // When the agent reads an email back on its own (before the booking tool
+  // gate), treat the caller's answer as the ONE required verification. Never
+  // infer confirmation from a statement that is not itself a question.
+  const source = String(text || '').trim();
+  if (!/(?:is that correct|is that right|please confirm|can you confirm|correct\s*\?)/i.test(source)) return '';
+  const match = source.match(/\b[a-z0-9._%+\-]+(?:@|\s+at\s+)[a-z0-9-]+(?:(?:\.|\s+dot\s+)[a-z0-9-]+)+\b/i);
+  if (!match) return '';
+  const email = match[0].replace(/\s+at\s+/i, '@').replace(/\s+dot\s+/gi, '.').toLowerCase();
+  if (!/^[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(email)) return '';
+  return email;
+}
+
 function isAffirmativeBookingConfirmation(text) {
   return confirmationIntent(text) === true;
 }
@@ -1693,37 +1713,37 @@ function dynamicVoiceResponseRules(state) {
 
   // ask_one_question is already a session-level Proxy instruction when enabled.
   if (state.rules?.show_arrival_time) {
-    rules.push("SHOW ARRIVAL TIME IS ON: every appointment time you speak must use the exact words 'arrival time between' followed by both the start and end times. Never speak only the start time.");
+    rules.push("For every appointment time, say 'arrival time between' plus both endpoints; never omit the end time.");
   }
   if (state.rules?.quotes_enabled === false) {
-    rules.push('PHONE SPOKEN PRICING IS OFF: do not state or infer service prices, line-item costs, quote totals, appointment totals, minimum charges, or grand totals. This does NOT block creating a real estimate: if the caller wants a quote sent, collect the required customer/service information and use nbb_send_estimate. Never tell the caller that pricing visibility is off or disabled. A savings_amount/spoken_savings explicitly returned for a savings date is allowed and should be stated because it reveals only the amount saved.');
+    rules.push('Spoken prices/totals are prohibited; do not mention that rule. You MAY state explicit savings_amount from offer slots. If a customer requests an estimate, collect details and send it via nbb_send_estimate, but never read its total.');
   }
   if (state.rules?.callback_only) {
-    rules.push('CALLBACK-COLLECTION MODE: collect a brief callback reason and customer name when practical, reuse the verified caller phone unless they explicitly provide a different confirmed number, submit nbb_request_callback, then confirm success and close with thanks/goodbye. Do not start quote, availability, estimate, or booking flows.');
+    rules.push('Callback-only: collect reason/name, use caller phone unless caller confirms another, call nbb_request_callback, then confirm and close. No booking, availability or estimate.');
   }
   if (state.estimateDeliveryPreference) {
-    rules.push(`ESTIMATE DELIVERY IS LOCKED FOR THIS CALL: the caller selected ${estimateDeliveryLabel(state.estimateDeliveryPreference)}. Do not ask text/email/both again unless the caller explicitly changes that preference.`);
+    rules.push(`Estimate delivery locked to ${estimateDeliveryLabel(state.estimateDeliveryPreference)}; do not re-ask unless caller changes it.`);
   }
   if (state.confirmedEmail) {
-    rules.push(`EMAIL IS CONFIRMED AND LOCKED FOR THIS CALL: use the exact canonical address ${JSON.stringify(state.confirmedEmail)}. Do not ask the caller to confirm it again and do not substitute a different address unless the caller explicitly changes it.`);
+    rules.push(`Confirmed email: ${JSON.stringify(state.confirmedEmail)}. Reuse exactly; no repeated verification unless caller changes it.`);
   }
   // Unconfirmed-email ownership is already in the immutable session prompt.
   if (state.serviceCollectionClosed) {
-    rules.push('SERVICE COLLECTION IS CLOSED FOR NOW: the caller already said they do not want additional services. Do not ask about adding services again unless they later add or change a service.');
+    rules.push('Caller finished service selection. Do not offer additional services again unless caller reopens it.');
   }
   // The open multi-service gate is already in the immutable session prompt.
   if (state.bookingPhoneChoiceResolved && state.confirmedPhone) {
-    rules.push(`BOOKING PHONE IS CONFIRMED AND LOCKED: use ${JSON.stringify(state.confirmedPhone)} as the booking phone. Source is ${state.bookingPhoneSource || 'confirmed'}. Do not ask which phone to use again and do not reconfirm this same number unless the caller explicitly changes it.`);
+    rules.push(`Confirmed booking phone (${state.bookingPhoneSource || 'confirmed'}): ${JSON.stringify(state.confirmedPhone)}. Reuse; do not re-ask unless caller changes it.`);
   } else if (state.awaitingBookingPhoneChoice) {
-    rules.push('BOOKING PHONE SOURCE IS WAITING FOR THE CALLER: ask only whether they want to use the number they are calling from or a different number. Do not assume the caller number. Do not prepare the booking until this choice is resolved.');
+    rules.push('Booking phone not chosen: ask use caller number or a different number; do not assume or prepare booking before answer.');
   }
   if (state.rules?.ask_booking_notes) {
     if (state.bookingNotesChoiceResolved) {
       rules.push(state.bookingNotes
-        ? 'APPOINTMENT NOTES CHECKPOINT IS RESOLVED: the caller supplied an appointment note and Relay will attach it to the booking. Do not ask for notes again unless the caller explicitly changes them.'
-        : 'APPOINTMENT NOTES CHECKPOINT IS RESOLVED: the caller declined to add appointment notes. Do not ask again unless the caller explicitly changes their decision.');
+        ? 'Booking notes supplied; Relay attaches them. Do not ask again unless changed.'
+        : 'Booking notes declined. Do not ask again unless caller changes their mind.');
     } else {
-      rules.push('APPOINTMENT NOTES CHECKPOINT IS REQUIRED FOR NEW BOOKINGS: near the end, before nbb_prepare_booking, ask exactly one question: "Would you like to add any notes for the appointment?" If no, call voice_set_booking_notes with mode none. If yes but they have not supplied the note yet, ask exactly one follow-up question for the note, then call voice_set_booking_notes with mode set.');
+      rules.push('For a new booking before nbb_prepare_booking, ask once if the caller wants notes. If no call voice_set_booking_notes mode none; if yes collect note then call mode set.');
     }
   }
   // Notes-OFF is already a session-level Proxy instruction.
@@ -2500,7 +2520,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
       && (Date.now() - state.bookingConfirmationAt) <= 120000;
     if (!confirmationFresh) {
       acknowledgeFunction(state, callId, { success: false, code: 'explicit_confirmation_required', message: 'The caller has not explicitly confirmed the prepared booking yet.' });
-      requestModelResponse(state, 'Read back the validated booking review and ask the caller for a clear yes before trying to submit it.', 'booking_confirmation_required', true);
+      requestModelResponse(state, 'Read back the validated booking review and request one explicit authorization, such as yes, submit, book it, or go ahead. Never require a second approval once the caller has authorized this exact prepared booking.', 'booking_confirmation_required', true);
       return;
     }
     // The model never supplies or chooses the review token. The Relay commits
@@ -2532,8 +2552,11 @@ async function executeNbbTool(state, name, callId, args = {}) {
   // v0.2.42: announce progress repeatedly for slow live-calendar calls, not
   // just once. Never stack model responses or leave a deferred callback behind
   // once the underlying tool settles. No synthetic availability is generated.
-  const progressDelay = Math.max(4, Math.min(20, Number(state.rules?.dead_air_seconds || 7))) * 1000;
-  const progressInterval = Math.max(9000, Math.min(12000, progressDelay));
+  // With the optimized tenant NBB calendar lookup generally returning within ~10 s,
+  // avoid an extra charged Realtime speech response just before the real results.
+  // Longer calls still get periodic reassurance. This affects progress speech only.
+  const progressDelay = Math.max(12000, Math.min(20000, Number(state.rules?.dead_air_seconds || 7) * 1000));
+  const progressInterval = Math.max(12000, Math.min(15000, progressDelay));
   const progressKey = callId || Symbol('nbb-tool-progress');
   let progressTimer = null;
   let progressSettled = false;
@@ -3016,7 +3039,7 @@ function handleOpenAIEvent(state, raw) {
     // A yes/no used to confirm contact data must NEVER also count as the final
     // booking confirmation. Those are separate user decisions.
     if (!consumedAsContactConfirmation && state.awaitingBookingConfirmation) {
-      if (isAffirmativeBookingConfirmation(transcript)) {
+      if (isAffirmativeBookingConfirmation(transcript) || isExplicitSubmitBookingApproval(transcript)) {
         state.bookingConfirmationAt = Date.now();
       } else if (isNegativeBookingConfirmation(transcript)) {
         state.bookingConfirmationAt = 0;
@@ -3055,6 +3078,17 @@ function handleOpenAIEvent(state, raw) {
         content: transcript,
         event: 'voice_agent_message',
       });
+      // The model may spontaneously ask for an email confirmation before
+      // nbb_prepare_booking. Capture that exact spoken readback, so the user's
+      // one affirmative answer satisfies the existing deterministic lock.
+      // We do not lock it until the caller explicitly answers affirmatively.
+      if (!state.pendingContactConfirmation && !state.confirmedEmail
+          && ['booking', 'estimate'].includes(String(state.workflowIntent || ''))) {
+        const spokenCandidate = emailFromAssistantConfirmation(transcript);
+        if (spokenCandidate) {
+          state.pendingContactConfirmation = { type: 'email', value: spokenCandidate, context: 'spoken_readback' };
+        }
+      }
       if (!state.serviceCollectionClosed && isAdditionalServiceQuestion(transcript)) {
         state.awaitingAdditionalServiceDecision = true;
       }

@@ -1,4 +1,4 @@
-# Nearby Booker Voice Relay v0.2.42
+# Nearby Booker Voice Relay v0.2.44
 
 This is the **standalone, isolated realtime media service** for Nearby Booker Phone AI.
 
@@ -81,3 +81,6 @@ The idle-call watchdog cannot terminate an active Nearby Booker tool request. It
 - Close the additional-services checkpoint for an explicit caller completion response to a recently spoken additional-services question, even when that question was generated without the deterministic tool gate.
 - After successfully validating an address, if the caller already closed service collection, tell the Realtime agent to proceed directly to availability instead of reopening the optional-service question.
 - Does not alter Proxy/NBB live-calendar searches, slot eligibility, pricing, booking writes, or Twilio routing. A 48-second availability lookup still requires NBB-side performance profiling.
+
+## v0.2.44 cost hygiene
+See RELAY-v0.2.44-COST-AND-CONVERSATION-HYGIENE.txt for scope, deployment cautions, and inherited improvements.

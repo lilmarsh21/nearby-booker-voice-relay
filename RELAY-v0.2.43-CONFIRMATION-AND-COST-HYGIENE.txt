@@ -1,0 +1,7 @@
+v0.2.43 (full source) built from v0.2.42.
+- Accept standalone "submit" as final booking approval only after prepare_booking has returned a review token.
+- Recognize a spontaneous assistant email read-back and require one caller confirmation; use the existing immutable confirmed-email state rather than asking again at prepare_booking.
+- Existing progress announcements, service closure state, payload compaction, and usage diagnostics preserved.
+- No model pricing/model/provider change, no added admin cost dashboard, no NBB or Proxy modifications.
+- Does not guarantee any specific dollar savings. Compare real API spend in the OpenAI Platform Usage dashboard.
+- Keep on staging before promoting to production; calls involving repeated emails and final authorization require real end-to-end testing.

@@ -1,6 +1,6 @@
 {
   "name": "nearby-booker-voice-relay",
-  "version": "0.2.42",
+  "version": "0.2.44",
   "private": true,
   "description": "Twilio Media Streams to OpenAI Realtime relay with authenticated Nearby Booker tenant tools; caller-authoritative contact locking, workflow continuity, privacy-safe existing-appointment recognition, Realtime payload compaction, conservative session-rule deduplication, fast natural delivery prompting, and per-call usage telemetry.",
   "type": "module",
