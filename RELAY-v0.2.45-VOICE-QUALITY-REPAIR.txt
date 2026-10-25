@@ -1,0 +1,11 @@
+Nearby Booker Voice Relay 0.2.45 — complete source built from 0.2.44.
+
+Targeted behavior corrections:
+- Restore earlier progress messages (6–9 seconds initially, 9–12 seconds thereafter), without asserting availability prematurely.
+- Use tool-specific pending-operation wording (address, availability, prepare, commit).
+- Suppress an unsolicited second opening response until the first caller speech event.
+- Avoid replaying post-service address requests when the assistant has already asked for the address on the same caller turn.
+- When the caller answers only “yes” to STANDARD-vs-LARGE stairs, require an unambiguous width choice; block quote/availability/prepare progression while this clarification remains unanswered.
+- Fix /health version reporting to 0.2.45. No NBB/Proxy changes, no tool schema changes, no model changes.
+
+Risk: This is a voice-state change requiring a staged test call before full deployment. Validate stairs, direct service selection, caller interruption, no duplicated greeting/address, long-running search progress, booking/reschedule/cancel, human transfer, message mode.

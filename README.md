@@ -84,3 +84,6 @@ The idle-call watchdog cannot terminate an active Nearby Booker tool request. It
 
 ## v0.2.44 cost hygiene
 See RELAY-v0.2.44-COST-AND-CONVERSATION-HYGIENE.txt for scope, deployment cautions, and inherited improvements.
+
+## v0.2.45 conversation/waiting fixes
+See RELAY-v0.2.45-VOICE-QUALITY-REPAIR.txt.

@@ -955,6 +955,39 @@ function isAdditionalServiceQuestion(text) {
   return asks.some((phrase) => t.includes(phrase));
 }
 
+// Narrow, context-sensitive speech safeguards. These do NOT choose service
+// variants; only callers or the authoritative NBB service definitions do.
+function isStairWidthEitherOrQuestion(text) {
+  const t = normalizedText(text);
+  return /\b(?:stair|stairs|step|steps)\b/.test(t)
+    && /\b(?:standard|normal)\b/.test(t)
+    && /\b(?:wide|wider|large|larger)\b/.test(t)
+    && /\b(?:or|either)\b/.test(t);
+}
+
+function isExplicitStairWidthAnswer(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  if (/\b(?:standard|normal|regular|narrow|small|wide|wider|large|larger|big|bigger)\b/.test(t)) return true;
+  // A number by itself can mean a count rather than the width of a step.
+  // Only explicit size comparisons count as an unambiguous answer.
+  return /\b(?:over|under|less than|more than|greater than|at most|at least)\s+(?:three|3)\s+(?:feet|foot|ft)\b/.test(t)
+    || /\b(?:three|four|five|six|3|4|5|6)(?:\s+and\s+a\s+half|\s+point\s+five)?\s+(?:feet|foot|ft)\b/.test(t)
+    || /\b(?:3[.]5|4[.]5|5[.]5)\s*(?:feet|foot|ft)\b/.test(String(text || '').toLowerCase());
+}
+
+function isAmbiguousStairWidthAnswer(text) {
+  const t = normalizedText(text);
+  return /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|uh huh|mhm|mm hmm|i do|please)$/.test(t);
+}
+
+function isServiceAddressQuestion(text) {
+  const t = normalizedText(text);
+  return /\b(?:address|street)\b/.test(t)
+    && /\b(?:what|where|share|give|tell|provide|need|please|can you)\b/.test(t)
+    && /\b(?:service|cleaning|appointment|booking|full|street)\b/.test(t);
+}
+
 function serviceRowsSignature(args = {}) {
   if (!Array.isArray(args?.services)) return '';
   const rows = args.services
@@ -1055,6 +1088,8 @@ function createConnectionState(twilioWs) {
     serviceCollectionClosed: false,
     awaitingAdditionalServiceDecision: false,
     serviceCollectionSignature: '',
+    awaitingStairWidthChoice: false,
+    addressQuestionAskedOnTurn: -1,
     workflowIntent: '',
     workflowIntentSetAt: 0,
     quoteSideRequestAt: 0,
@@ -1075,6 +1110,7 @@ function createConnectionState(twilioWs) {
     startupAudioGate: true,
     greetingAudioStarted: false,
     openingGreetingRequested: false,
+    greetingCallerVadSeen: false,
     droppedStartupAudioFrames: 0,
     pendingFunctionArgs: new Map(),
     handledFunctionCalls: new Set(),
@@ -1855,6 +1891,11 @@ function responseAllowedByDeterministicGate(state, reason = 'normal') {
   if (state.awaitingAdditionalServiceDecision) {
     return r === 'additional_service_check_required';
   }
+  if (state.awaitingStairWidthChoice) return r === 'stair_width_clarification';
+  // A spontaneous assistant turn may already have asked for the address.
+  // Never replay a queued post-service continuation that asks it again.
+  if (r === 'service_collection_closed_continue'
+      && state.addressQuestionAskedOnTurn === Number(state.callerTurn || 0)) return false;
 
   // Contact confirmation is likewise a hard conversational gate. While an
   // email/alternate phone is awaiting the caller's yes/no, unrelated after-tool
@@ -2199,6 +2240,17 @@ async function executeNbbTool(state, name, callId, args = {}) {
   }
 
   let toolArgs = args && typeof args === 'object' ? { ...args } : {};
+
+  // No tool may infer standard or large stairs from "yes" to an either/or
+  // question. Require the caller to state one option before progression.
+  if (state.awaitingStairWidthChoice &&
+      ['nbb_get_quote', 'nbb_get_availability', 'nbb_prepare_booking', 'nbb_send_estimate'].includes(name)) {
+    acknowledgeFunction(state, callId, {
+      success: false, code: 'voice_stair_width_choice_required',
+      message: 'The caller must explicitly select standard or large stairs.',
+    });
+    return;
+  }
 
   // If the assistant already asked the deterministic "any other services?"
   // question, progression tools must wait for an actual caller answer. Returning
@@ -2549,14 +2601,11 @@ async function executeNbbTool(state, name, callId, args = {}) {
     tool_phase: 'start',
   });
 
-  // v0.2.42: announce progress repeatedly for slow live-calendar calls, not
-  // just once. Never stack model responses or leave a deferred callback behind
-  // once the underlying tool settles. No synthetic availability is generated.
-  // With the optimized tenant NBB calendar lookup generally returning within ~10 s,
-  // avoid an extra charged Realtime speech response just before the real results.
-  // Longer calls still get periodic reassurance. This affects progress speech only.
-  const progressDelay = Math.max(12000, Math.min(20000, Number(state.rules?.dead_air_seconds || 7) * 1000));
-  const progressInterval = Math.max(12000, Math.min(15000, progressDelay));
+  // v0.2.45: reassure callers earlier during long tools (6-9 s first notice,
+  // 9-12 s thereafter). Timers stop when the tool settles; never invent slots.
+  // A progress response only starts when the caller/model is not speaking.
+  const progressDelay = Math.max(6000, Math.min(9000, Number(state.rules?.dead_air_seconds || 7) * 1000));
+  const progressInterval = Math.max(9000, Math.min(12000, progressDelay));
   const progressKey = callId || Symbol('nbb-tool-progress');
   let progressTimer = null;
   let progressSettled = false;
@@ -2579,11 +2628,17 @@ async function executeNbbTool(state, name, callId, args = {}) {
     // A caller utterance, active AI speech, or an in-flight response takes
     // priority over a filler. We will recheck; no queued filler is left behind.
     if (!state.callerSpeechActive && !state.responseActive && !state.responseRequestPending && !state.aiAudioActive && !state.aiPlaybackPending) {
-      const messages = [
-        'Say one brief natural sentence: "I’m still checking the available appointment times." Do not ask a question or claim a result.',
-        'Say one brief natural sentence: "This is taking a little longer than usual, but I’m still checking." Do not ask a question or claim a result.',
-        'Say one brief natural sentence: "I’m still working on those appointment options." Do not ask a question or claim a result.',
-      ];
+      const messages = name === 'nbb_validate_address'
+        ? ['Say only: "I’m still checking that address." No questions or assumptions.']
+        : name === 'nbb_commit_booking'
+          ? ['Say only: "I’m submitting your appointment request now." Do not claim it succeeded yet.']
+          : name === 'nbb_prepare_booking'
+            ? ['Say only: "I’m getting your appointment details ready." No questions or assumptions.']
+            : [
+              'Say only: "I’m still checking the available appointment times." Do not claim a result.',
+              'Say only: "This is taking a little longer, but I’m still checking." Do not claim a result.',
+              'Say only: "I’m still working on those options." Do not claim a result.',
+            ];
       requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
       progressCount += 1;
     }
@@ -2827,6 +2882,18 @@ function handleOpenAIEvent(state, raw) {
   const type = String(event?.type || '');
 
   if (type === 'response.created') {
+    // Realtime occasionally generates a SECOND opening response from startup
+    // audio even though Relay already requested exactly one greeting. Reject
+    // an unsolicited extra response until genuine caller VAD/transcription.
+    // This cannot cancel Relay's requested opening response.
+    if (state.openingGreetingRequested && state.greetingAudioStarted
+        && !state.greetingCallerVadSeen && Number(state.callerTurn || 0) === 0
+        && !state.responseRequestPending && !state.messageMode) {
+      safeSend(state.openaiWs, { type: 'response.cancel' });
+      state.responseActive = true;
+      state.responseRequestPending = false;
+      return;
+    }
     state.responseActive = true;
     state.responseRequestPending = false;
     state.responseHadAudio = false;
@@ -2928,6 +2995,19 @@ function handleOpenAIEvent(state, raw) {
       });
 
       updateWorkflowIntentFromTranscript(state, transcript);
+
+      if (state.awaitingStairWidthChoice) {
+        if (isExplicitStairWidthAnswer(transcript)) {
+          state.awaitingStairWidthChoice = false;
+        } else if (isAmbiguousStairWidthAnswer(transcript)) {
+          queueDeterministicContinuation(
+            state,
+            'The caller answered yes to a choice between STANDARD and LARGE steps. That does not identify either option. Ask only: "Are the steps standard width, three feet or less, or large steps wider than three feet?" Wait for the answer. Do not infer a variant.',
+            'stair_width_clarification'
+          );
+          return;
+        }
+      }
 
       if (state.serviceCollectionClosed && isExplicitServiceAdditionOrChange(transcript)) {
         state.serviceCollectionClosed = false;
@@ -3092,6 +3172,11 @@ function handleOpenAIEvent(state, raw) {
       if (!state.serviceCollectionClosed && isAdditionalServiceQuestion(transcript)) {
         state.awaitingAdditionalServiceDecision = true;
       }
+      if (isStairWidthEitherOrQuestion(transcript)) state.awaitingStairWidthChoice = true;
+      if (isServiceAddressQuestion(transcript)) {
+        state.addressQuestionAskedOnTurn = Number(state.callerTurn || 0);
+        if (state.queuedResponseReason === 'service_collection_closed_continue') clearQueuedResponse(state);
+      }
       if (state.bookingWrapupRequired && bookingWrapupSatisfied(transcript)) {
         state.bookingWrapupRequired = false;
       }
@@ -3112,9 +3197,9 @@ function handleOpenAIEvent(state, raw) {
       clearVoiceMessageSilenceTimer(state);
       return;
     }
-    // Startup caller audio is deliberately suppressed until greeting audio starts,
-    // so a stale/early VAD event must never clear the deterministic greeting.
+    // Startup caller audio is deliberately suppressed until greeting audio starts.
     if (state.startupAudioGate) return;
+    state.greetingCallerVadSeen = true;
 
     // Pause the silence cutoff while a possible caller turn is being evaluated.
     // A false/noisy VAD start does NOT permanently cancel dead-air recovery.
@@ -3333,7 +3418,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.41' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.45' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
