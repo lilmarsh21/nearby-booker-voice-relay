@@ -1,4 +1,4 @@
-# Nearby Booker Voice Relay v0.2.44
+# Nearby Booker Voice Relay v0.2.46
 
 This is the **standalone, isolated realtime media service** for Nearby Booker Phone AI.
 
@@ -87,3 +87,11 @@ See RELAY-v0.2.44-COST-AND-CONVERSATION-HYGIENE.txt for scope, deployment cautio
 
 ## v0.2.45 conversation/waiting fixes
 See RELAY-v0.2.45-VOICE-QUALITY-REPAIR.txt.
+
+## v0.2.46 targeted confirmed-phone/notes repair (2026-10-27)
+
+- A repeated model-invoked `voice_set_booking_phone` cannot clear a previously confirmed phone or reopen the contact-confirmation gate. Only an explicit caller-requested correction can permit replacement.
+- A clear "no" in reply to the **most recent booking-notes question** resolves notes, never rejects the booking phone.
+- After booking phone confirmation, the next prompt explicitly asks for the missing customer name, then remaining notes or booking preparation and final authorization.
+- No Twilio, OpenAI model, Proxy, NBB, availability, service selection, pricing, quote, booking-write, SMS or email integration contracts changed.
+- Local simulated regression tests do not establish the exact hidden tool sequence on a production call. Review the private troubleshooting timeline for that.

@@ -988,6 +988,44 @@ function isServiceAddressQuestion(text) {
     && /\b(?:service|cleaning|appointment|booking|full|street)\b/.test(t);
 }
 
+// An already-confirmed booking number is immutable unless the CALLER clearly
+// asks to replace it. Model-generated voice_set_booking_phone retries do not
+// authorize a change. Retain authorization across the follow-up number turn.
+function requestsBookingPhoneChange(text) {
+  const t = normalizedText(text);
+  if (!t || /\b(?:don't|dont|do not|never)\b(?:\s+\w+){0,3}\s+(?:change|switch|update|replace)\b/.test(t)) return false;
+  // Keep the change verb adjacent to PHONE/NUMBER. A request such as
+  // "change my appointment date; that phone number is correct" must never
+  // authorize an otherwise unsolicited phone change by a stale model tool.
+  return /\b(?:change|switch|update|replace|correct)\s+(?:(?:my|the|this|that|booking|appointment)\s+){0,2}(?:phone|contact|callback)(?:\s+number)?\b/.test(t)
+    || /\b(?:change|switch|update|replace|correct)\s+(?:(?:my|the|this|that)\s+){1,2}number\b/.test(t)
+      && !/\bnumber\s+of\s+(?:rooms?|steps?|stairs?|services?|windows?|items?)\b/.test(t)
+    || /\b(?:use|make|set|put)\s+(?:(?:my|the|it|that|a|an)\s+){0,2}(?:other|second|different|another|new)\s+(?:phone\s+)?number\b/.test(t)
+    || /\b(?:wrong|incorrect|different|another|new)\s+(?:phone\s+)?number\b/.test(t)
+    || /\b(?:phone\s+)?number\s+(?:is|was)\s+(?:wrong|incorrect)\b/.test(t);
+}
+
+function isBookingNotesQuestion(text) {
+  const t = normalizedText(text);
+  return /\b(?:notes?|access details|team should know)\b/.test(t)
+    && /\b(?:would you|do you|any|like to|want to|add|need to)\b/.test(t);
+}
+
+function isBookingNotesDecline(text) {
+  const t = normalizedText(text);
+  return /^(?:no|nope|nah|none|nothing|no thanks|no thank you|no notes|nothing to add|no notes thanks|i dont have any notes|i do not have any notes|thats all|that is all)$/.test(t);
+}
+
+function bookingPhoneOrNotesNextInstruction(state) {
+  const nameReminder = state.customerName
+    ? 'The customer name is already captured. Reuse it.'
+    : 'If the caller has not already given their name anywhere in this conversation, ask for it once; otherwise reuse the name they already stated. Do not invent one.';
+  const notesReminder = state.rules?.ask_booking_notes && !state.bookingNotesChoiceResolved
+    ? 'Then resolve the optional appointment notes once.'
+    : 'Do not repeat completed appointment-notes questions.';
+  return `The booking phone is confirmed and locked; NEVER ask for or reconfirm it unless the caller explicitly changes it. ${nameReminder} ${notesReminder} Continue immediately with the booking review and explicit authorization using the actual NBB tools. Do not claim the appointment is booked before successful commit, and do not stall with generic filler.`;
+}
+
 function serviceRowsSignature(args = {}) {
   if (!Array.isArray(args?.services)) return '';
   const rows = args.services
@@ -1072,6 +1110,7 @@ function createConnectionState(twilioWs) {
     confirmedEmail: '',
     bookingPhoneChoiceResolved: false,
     bookingPhoneSource: '',
+    bookingPhoneChangeRequested: false,
     awaitingBookingPhoneChoice: false,
     bookingNotesChoiceResolved: false,
     bookingNotes: '',
@@ -2135,6 +2174,27 @@ function handleBookingPhonePreferenceTool(state, callId, args = {}) {
   const mode = normalizedText(args?.mode || '');
   const phone = normalizedPhone(args?.phone || '');
 
+  // A stale or repeated tool call previously cleared a confirmed phone and
+  // reopened a pending confirmation. A later "No" to booking NOTES then got
+  // consumed as a phone rejection. This hard gate makes that impossible unless
+  // the customer actually requested a change in their own speech.
+  const alreadyConfirmed = Boolean(state.bookingPhoneChoiceResolved && state.confirmedPhone);
+  if (alreadyConfirmed && (!state.bookingPhoneChangeRequested ||
+      ((mode === 'alternate' || mode === 'different') && phone === state.confirmedPhone))) {
+    state.bookingPhoneChangeRequested = false;
+    state.customerPhone = state.confirmedPhone;
+    if (state.pendingContactConfirmation?.type === 'phone'
+        && normalizedPhone(state.pendingContactConfirmation.value) === state.confirmedPhone) {
+      state.pendingContactConfirmation = null; // Discard only a matching stale duplicate gate.
+    }
+    acknowledgeFunction(state, callId, {
+      success: true, confirmed: true, already_confirmed: true,
+      booking_phone: state.confirmedPhone, source: state.bookingPhoneSource || 'confirmed'
+    });
+    requestModelResponse(state, bookingPhoneOrNotesNextInstruction(state), 'booking_phone_already_confirmed_continue', true);
+    return;
+  }
+
   if (mode === 'caller') {
     if (!state.callerPhone) {
       acknowledgeFunction(state, callId, { success: false, code: 'caller_phone_unavailable', message: 'The live caller number is unavailable. Ask for the booking phone number.' });
@@ -2146,6 +2206,7 @@ function handleBookingPhonePreferenceTool(state, callId, args = {}) {
     state.confirmedPhone = state.callerPhone;
     state.bookingPhoneChoiceResolved = true;
     state.bookingPhoneSource = 'caller';
+    state.bookingPhoneChangeRequested = false;
     state.awaitingBookingPhoneChoice = false;
     state.pendingContactConfirmation = null;
     invalidatePreparedBookingForContactChange(state);
@@ -2169,6 +2230,7 @@ function handleBookingPhonePreferenceTool(state, callId, args = {}) {
       state.confirmedPhone = state.callerPhone;
       state.bookingPhoneChoiceResolved = true;
       state.bookingPhoneSource = 'caller';
+      state.bookingPhoneChangeRequested = false;
       invalidatePreparedBookingForContactChange(state);
       acknowledgeFunction(state, callId, { success: true, booking_phone: state.confirmedPhone, source: 'caller', confirmed: true });
       requestModelResponse(state, 'That number matches the number they are calling from, so it is already confirmed. Continue with the next single missing booking item and do not reconfirm the phone.', 'booking_phone_matches_caller', true);
@@ -2179,6 +2241,7 @@ function handleBookingPhonePreferenceTool(state, callId, args = {}) {
     state.confirmedPhone = '';
     state.bookingPhoneChoiceResolved = false;
     state.bookingPhoneSource = 'alternate';
+    state.bookingPhoneChangeRequested = false;
     invalidatePreparedBookingForContactChange(state);
     acknowledgeFunction(state, callId, { success: false, code: 'voice_phone_confirmation_required', message: 'Confirm the different booking phone number once.' });
     requestModelResponse(state, `Read back this booking phone number exactly once: ${JSON.stringify(phone)}. Ask if it is correct, then stop and wait. Do not ask any other question.`, 'booking_phone_confirmation_required', true);
@@ -2995,6 +3058,10 @@ function handleOpenAIEvent(state, raw) {
       });
 
       updateWorkflowIntentFromTranscript(state, transcript);
+      if (state.bookingPhoneChoiceResolved && state.confirmedPhone && requestsBookingPhoneChange(transcript)) {
+        state.bookingPhoneChangeRequested = true;
+        pushInternalCallContext(state, 'The CALLER expressly requested a booking phone-number change. The existing confirmed number remains valid until a replacement number is provided and confirmed once. The next voice_set_booking_phone may request that replacement.');
+      }
 
       if (state.awaitingStairWidthChoice) {
         if (isExplicitStairWidthAnswer(transcript)) {
@@ -3065,6 +3132,43 @@ function handleOpenAIEvent(state, raw) {
       pushInternalCallContext(state, 'The caller did not close service collection and may be adding another service. Handle this caller turn as additional-service intent. Do not move to the service address until the added service is resolved, then ask whether they want anything else.');
     }
 
+    // "No" to the most recent spoken NOTES question belongs to notes, not an
+    // older/surplus phone-confirmation state. Resolve this one-turn checkpoint
+    // deterministically so the assistant cannot silently stall or reject a
+    // phone number the customer already confirmed.
+    if (state.rules?.ask_booking_notes && !state.bookingNotesChoiceResolved
+        && isBookingNotesQuestion(latestAssistantMessage?.content || '')
+        && isBookingNotesDecline(transcript)) {
+      state.bookingNotes = '';
+      state.bookingNotesChoiceResolved = true;
+      state.awaitingBookingNotesChoice = false;
+      invalidatePreparedBookingForContactChange(state);
+      const pendingPhone = state.pendingContactConfirmation?.type === 'phone'
+        ? state.pendingContactConfirmation : null;
+      if (pendingPhone && state.confirmedPhone === normalizedPhone(pendingPhone.value)
+          && state.bookingPhoneChoiceResolved && !state.bookingPhoneChangeRequested) {
+        state.pendingContactConfirmation = null;
+      }
+      // Keep any genuinely pending email/phone checkpoint intact, but do not
+      // allow an unrelated contact gate to silently discard the notes reply.
+      if (state.pendingContactConfirmation?.type === 'email'
+          && state.confirmedEmail && state.confirmedEmail === normalizedEmail(state.pendingContactConfirmation.value)) {
+        state.pendingContactConfirmation = null;
+      }
+      const pendingContactType = String(state.pendingContactConfirmation?.type || '');
+      pushInternalCallContext(state, 'The caller just answered NO to optional appointment notes. Notes are resolved as NONE. This was NOT rejection of any contact value. Continue the booking and do not ask for notes again.');
+      queueDeterministicContinuation(
+        state,
+        pendingContactType
+          ? `The caller declined NOTES, not the ${pendingContactType}. There is a separate unconfirmed ${pendingContactType} pending. Read it back once and ask for confirmation, then continue.`
+          : bookingPhoneOrNotesNextInstruction(state),
+        pendingContactType === 'phone' ? 'booking_phone_confirmation_required'
+          : pendingContactType === 'email' ? 'email_confirmation_required'
+          : 'booking_notes_declined_continue'
+      );
+      return;
+    }
+
     let consumedAsContactConfirmation = false;
     if (state.pendingContactConfirmation) {
       const pending = state.pendingContactConfirmation;
@@ -3080,6 +3184,7 @@ function handleOpenAIEvent(state, raw) {
           if (pending.context === 'booking_phone') {
             state.bookingPhoneChoiceResolved = true;
             state.bookingPhoneSource = state.customerPhone === state.callerPhone ? 'caller' : 'alternate';
+            state.bookingPhoneChangeRequested = false;
             state.awaitingBookingPhoneChoice = false;
           }
           invalidatePreparedBookingForContactChange(state);
@@ -3088,7 +3193,9 @@ function handleOpenAIEvent(state, raw) {
         pushInternalCallContext(state, `The caller explicitly confirmed the ${pending.type} ${pending.value}. This value is now locked for the call. Continue the pending estimate/booking flow using that exact value without asking again, even if a later model retry proposes a different spelling or formatting.`);
         queueDeterministicContinuation(
           state,
-          `The caller just confirmed the ${pending.type}. It is locked. Do NOT ask them to confirm it again. Continue with the next single missing item in the current flow; if all required details are present, proceed to the appropriate Nearby Booker tool.`,
+          pending.type === 'phone' && pending.context === 'booking_phone'
+            ? bookingPhoneOrNotesNextInstruction(state)
+            : `The caller just confirmed the ${pending.type}. It is locked. Do NOT ask them to confirm it again. Continue with the next single missing item in the current flow; if all required details are present, proceed to the appropriate Nearby Booker tool.`,
           `${pending.type}_confirmed_continue`
         );
       } else if (isNegativeBookingConfirmation(transcript)) {
@@ -3418,7 +3525,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.45' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.46' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });

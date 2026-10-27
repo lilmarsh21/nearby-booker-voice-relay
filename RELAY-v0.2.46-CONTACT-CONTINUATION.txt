@@ -1,0 +1,47 @@
+Nearby Booker Voice Relay v0.2.46 | 2026-10-27
+Exact base: user-supplied server.js + package.json v0.2.45.
+
+Observed in two calls: alternate number confirmed, followed by a booking stall.
+In one call the agent asked about notes, then a "No" to NOTES reopened phone correction.
+
+Verified reproduceable code defect in v0.2.45:
+A second voice_set_booking_phone with the already-confirmed alternate phone clears
+confirmedPhone and bookingPhoneChoiceResolved and opens a new pending phone confirmation.
+Then "No" to notes can be misclassified as rejecting the phone.
+
+Targeted changes in v0.2.46:
+- Suppress redundant model attempts to reset an already-confirmed booking phone.
+- Permit real customer-requested phone corrections; candidate must be confirmed.
+- Interpret a clear declined booking-notes answer in context, not as phone rejection.
+- After confirmed phone, ask for missing customer name and proceed to remaining
+  fields and review; never claim appointment booked before commit.
+- /health and package.json report 0.2.46.
+
+Scope: server.js, package.json, README.md, this release note. No other
+existing source files changed. No Proxy or NBB changes.
+
+Production caveat: the customer-visible transcript does not expose private
+Realtime function call traces or definitive hangup reason. The repeated-tool
+sequence was recreated from the uploaded code and reproduces the symptom,
+but it is not proved to be the one seen on those calls.
+
+Risk: low-to-moderate, confined to per-call phone confirmation and optional
+notes state and continuation instructions. Explicit phone changes must be
+tested; ambiguous utterances may require clear customer clarification.
+
+Tests: see accompanying test results. Never deploy directly to production
+without one staged inbound call for alternate number, correction, no notes,
+then booking review and commit; also exercise existing phone, email,
+services/variants, availability, and end-of-call close.
+
+Local verification (2026-10-27):
+  node --check server.js: PASSED
+  contact-checkpoints.cjs: 16/16 PASSED
+  booking-lifecycle-smoke.cjs: 3/3 PASSED
+  npm dependencies were not installed and no live WebSocket/Realtime session
+  or actual Twilio, Proxy, tenant NBB or booking transaction was invoked.
+
+Important: the private troubleshooting timeline must confirm which tool events
+actually preceded the second phone reset and the later dead air. This update
+fixes the reproduced contact reset and notes-answer mix-up, not every
+possible Realtime silence or transcript failure.
