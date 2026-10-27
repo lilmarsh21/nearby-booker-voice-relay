@@ -371,7 +371,7 @@ function pushFastNaturalDeliveryProfile(state) {
       role: 'system',
       content: [{
         type: 'input_text',
-        text: 'VOICE DELIVERY PROFILE — never read this aloud: Sound like a relaxed, competent human receptionist in a real phone conversation. Keep the pace slightly brisk, calm, warm, and conversational. Use natural contractions and natural intonation. Default to one short sentence or two very short sentences. Answer the caller directly, then ask only the next necessary question. Do not restate what the caller just said unless clarification is required. Avoid filler and scripted call-center language such as “Absolutely,” “Certainly,” “I would be happy to,” “Great question,” or long acknowledgements. Do not narrate tools, actions, or internal reasoning. Keep explanations concise unless the caller asks for more detail. Preserve every existing business rule, safety rule, required confirmation, deterministic checkpoint, and exact required wording.'
+        text: 'VOICE DELIVERY PROFILE — never read this aloud: Sound like a relaxed, competent human receptionist in a real phone conversation. Keep the pace slightly brisk, calm, warm, and conversational. Use natural contractions and natural intonation. Default to one short sentence or two very short sentences. Answer the caller directly, then ask only the next necessary question. Do not restate what the caller just said unless clarification is required. Do not generate standalone acknowledgments like "Okay" followed by a second response asking the next question; combine the acknowledgement and next necessary question in one short spoken turn when possible. Avoid filler and scripted call-center language such as “Absolutely,” “Certainly,” “I would be happy to,” “Great question,” or long acknowledgements. Do not narrate tools, actions, or internal reasoning. Keep explanations concise unless the caller asks for more detail. Preserve every existing business rule, safety rule, required confirmation, deterministic checkpoint, and exact required wording.'
       }],
     },
   });
@@ -550,6 +550,14 @@ function captureRealtimeUsage(state, event) {
   const outputDetails = usage.output_token_details || usage.output_tokens_details || {};
   const u = state.realtimeUsage;
   u.responses += 1;
+  const reason = String(state.activeResponseReason || 'unknown').replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
+  if (!u.byReason || typeof u.byReason !== 'object') u.byReason = {};
+  const row = u.byReason[reason] || { responses: 0, input: 0, cached: 0, output: 0 };
+  row.responses += 1;
+  row.input += Number(usage.input_tokens || 0);
+  row.cached += Number(inputDetails.cached_tokens || 0);
+  row.output += Number(usage.output_tokens || 0);
+  u.byReason[reason] = row;
   u.totalTokens += Number(usage.total_tokens || 0);
   u.inputTokens += Number(usage.input_tokens || 0);
   u.inputTextTokens += Number(inputDetails.text_tokens || 0);
@@ -586,6 +594,12 @@ function realtimeUsageDiagnostic(state) {
     cached: Number(u.cachedTokens || 0),
     cached_text: Number(u.cachedTextTokens || 0),
     cached_audio: Number(u.cachedAudioTokens || 0),
+    uncached_input: Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedTokens || 0)),
+    cached_input_percent: Number(u.inputTokens || 0) ? Math.round(100 * Number(u.cachedTokens || 0) / Number(u.inputTokens || 0)) : 0,
+    average_input_per_response: Number(u.responses || 0) ? Math.round(Number(u.inputTokens || 0) / Number(u.responses || 0)) : 0,
+    // No contents, caller identifiers, contact values or credentials in this telemetry.
+    response_reasons: Object.fromEntries(Object.entries(u.byReason || {}).sort((a,b) => b[1].input - a[1].input).slice(0, 8)),
+    checkpoint_counts: state.conversationCheckpointCounts || {},
     output_tokens: Number(u.outputTokens || 0),
     output_text: Number(u.outputTextTokens || 0),
     output_audio: Number(u.outputAudioTokens || 0),
@@ -932,11 +946,20 @@ function isNoMoreServicesReply(text) {
 function isExplicitServiceAdditionOrChange(text) {
   const t = normalizedText(text);
   if (!t) return false;
+  // An appointment note may mention carpet, treatment, or the word "cleaning".
+  // This is still a NOTE unless the same utterance separately requests a service.
+  const addingNotes = /\b(?:add|include|leave|make)\s+(?:(?:me|an?|some|the|appointment)\s+){0,2}notes?\b/.test(t);
+  const distinctExtraService = /\b(?:and|also|plus)\s+(?:please\s+)?(?:add|include|clean|schedule)\b.{0,60}\b(?:service|cleaning|treatment|vent|carpet|upholstery|loveseat|love seat|couch|sofa|sectional|chair|stair|steps|tile|rug|protector|enzyme)\b/.test(t);
+  if (addingNotes && !distinctExtraService) return false;
   const patterns = [
-    /\b(?:add|include)\b.*\b(?:service|cleaning|treatment|vent|carpet|upholstery|couch|sofa|sectional|stair|tile|rug|protector|enzyme)\b/,
-    /\b(?:also need|also want|need another|want another|one more service|one more thing)\b/,
-    /\b(?:change|switch|replace|remove)\b.*\b(?:service|cleaning|treatment|vent|carpet|upholstery|couch|sofa|sectional|stair|tile|rug|protector|enzyme)\b/,
-    /\b(?:can we|could we|i want to|i need to|i would like to|i'd like to)\b.*\b(?:add|include|change|remove)\b/,
+    /\b(?:add|include)\b.*\b(?:service|cleaning|treatment|vent|carpet|upholstery|loveseat|love seat|couch|sofa|sectional|chair|stair|tile|rug|protector|enzyme)\b/,
+    // A vague "one more thing" or "I'd like to add notes" is NOT a service
+    // change. Only reopen service selection when a specific service is named.
+    /\b(?:also need|also want|need another|want another|one more)\b.{0,65}\b(?:service|cleaning|treatment|vent|carpet|upholstery|loveseat|love seat|couch|sofa|sectional|chair|stair|steps|tile|rug|protector|enzyme)\b/,
+    /\b(?:change|switch|replace|remove)\b.*\b(?:service|cleaning|treatment|vent|carpet|upholstery|loveseat|love seat|couch|sofa|sectional|chair|stair|tile|rug|protector|enzyme)\b/,
+    // Never classify a request to ADD APPOINTMENT NOTES as a new service.
+    // The broad "I would like to add" alternative reopened services mid-booking.
+    /\b(?:can we|could we|i want to|i need to|i would like to|i'd like to)\b.{0,65}\b(?:add|include|change|remove)\b.{0,65}\b(?:service|cleaning|treatment|vent|carpet|upholstery|loveseat|love seat|couch|sofa|sectional|chair|stair|steps|tile|rug|protector|enzyme)\b/,
   ];
   return patterns.some((pattern) => pattern.test(t));
 }
@@ -1005,6 +1028,14 @@ function requestsBookingPhoneChange(text) {
     || /\b(?:phone\s+)?number\s+(?:is|was)\s+(?:wrong|incorrect)\b/.test(t);
 }
 
+function requestsEmailChange(text) {
+  const t = normalizedText(text);
+  if (!t) return false;
+  if (/\b(?:don'?t|do not|never)\b.{0,30}\b(?:change|update|correct|replace)\b/.test(t)) return false;
+  return /\b(?:change|update|correct|replace|switch)\b.{0,35}\b(?:email|e mail)\b/.test(t)
+    || /\b(?:email|e mail)\b.{0,20}\b(?:wrong|incorrect|needs changing)\b/.test(t);
+}
+
 function isBookingNotesQuestion(text) {
   const t = normalizedText(text);
   return /\b(?:notes?|access details|team should know)\b/.test(t)
@@ -1024,6 +1055,55 @@ function bookingPhoneOrNotesNextInstruction(state) {
     ? 'Then resolve the optional appointment notes once.'
     : 'Do not repeat completed appointment-notes questions.';
   return `The booking phone is confirmed and locked; NEVER ask for or reconfirm it unless the caller explicitly changes it. ${nameReminder} ${notesReminder} Continue immediately with the booking review and explicit authorization using the actual NBB tools. Do not claim the appointment is booked before successful commit, and do not stall with generic filler.`;
+}
+
+// Multiple returned appointment windows require a specific caller choice.
+// A vague "I'll take that" must never be treated as the first option.
+function isVagueSlotChoice(text) {
+  const t = normalizedText(text);
+  return /^(?:i'?ll take that|i will take that|i'?ll take it|i will take it|that works|that'?ll work|that will work|that sounds good|sounds good|that one|yes|yeah|sure|okay|ok|fine|works for me)$/.test(t);
+}
+
+function explicitSlotChoice(text, offered = []) {
+  const t = normalizedText(text);
+  if (!t || !Array.isArray(offered) || !offered.length) return false;
+  // Ordinal choices are valid only when the caller has actually been offered
+  // options. This is presentation selection, not availability eligibility.
+  if (/\b(?:the\s+)?(?:first|1st|second|2nd|third|3rd)\s+(?:one|option|slot|time|window|date)\b/.test(t)
+      || /^(?:first|1st|second|2nd|third|3rd)$/.test(t)) return true;
+  // Match date phrases from the authoritative returned slots (not model guesses).
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  // Speech recognition may write window endpoints as words ("eight and nine").
+  const wordHours = ['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve'];
+  const numericText = t.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/g,
+    (word) => String(wordHours.indexOf(word)));
+  const dateMatches = offered.filter((slot) => {
+    const match = String(slot?.date || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return false;
+    const month = months[Number(match[2]) - 1];
+    const day = String(Number(match[3]));
+    return month && new RegExp(`\\b${month}\\s+${day}(?:st|nd|rd|th)?\\b`).test(t);
+  });
+  if (dateMatches.length === 1) return true;
+  // A shared date is not enough to select among multiple arrival windows.
+  return offered.some((slot) => {
+    const date = String(slot?.date || '');
+    const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return false;
+    const month = months[Number(match[2])-1];
+    const day = String(Number(match[3]));
+    // Date alone was already handled only if it identified one option.
+    const window = slot?.window || {};
+    const start = String(window.start || slot.start || '');
+    const end = String(window.end || slot.end || '');
+    const from = Number(start.split(':')[0]);
+    const to = Number(end.split(':')[0]);
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+    const spokenFrom = from > 12 ? from - 12 : from;
+    const spokenTo = to > 12 ? to - 12 : to;
+    const starts = new RegExp(`\\b${spokenFrom}\\s+(?:to|and|through|until|-)\\s+${spokenTo}\\b`);
+    return starts.test(numericText) || (numericText.includes(start.toLowerCase()) && numericText.includes(end.toLowerCase()));
+  });
 }
 
 function serviceRowsSignature(args = {}) {
@@ -1129,6 +1209,10 @@ function createConnectionState(twilioWs) {
     serviceCollectionSignature: '',
     awaitingStairWidthChoice: false,
     addressQuestionAskedOnTurn: -1,
+    offeredVoiceSlots: [],
+    slotSelectionConfirmed: true,
+    slotClarificationPending: false,
+    conversationCheckpointCounts: { service_reopen: 0, ambiguous_slot: 0, contact_confirmed: 0, stale_email_repeat: 0 },
     workflowIntent: '',
     workflowIntentSetAt: 0,
     quoteSideRequestAt: 0,
@@ -2425,6 +2509,13 @@ async function executeNbbTool(state, name, callId, args = {}) {
   }
 
   if (name === 'nbb_prepare_booking') {
+    // No booking preparation may infer an appointment window from a vague reply.
+    // This does not alter availability, availability tools, or NBB slot validation.
+    if (!state.slotSelectionConfirmed && state.offeredVoiceSlots?.length > 1) {
+      acknowledgeFunction(state, callId, { success: false, code: 'voice_arrival_window_selection_required', message: 'The caller has not clearly selected one of the offered appointment windows.' });
+      requestModelResponse(state, 'Ask which specific offered date and arrival window the caller wants. Do not select a slot or continue booking preparation until they answer.', 'arrival_window_clarification', true);
+      return;
+    }
     if (!toolArgs.customer || typeof toolArgs.customer !== 'object') toolArgs.customer = {};
     if (!state.bookingPhoneChoiceResolved || !state.confirmedPhone) {
       const candidatePhone = normalizedPhone(toolArgs.customer.phone || '');
@@ -2718,7 +2809,15 @@ async function executeNbbTool(state, name, callId, args = {}) {
     stopToolProgress();
 
     let result = response?.result ?? {};
-    if (name === 'nbb_get_availability') result = sortVoiceAvailabilityResult(result);
+    if (name === 'nbb_get_availability') {
+      result = sortVoiceAvailabilityResult(result);
+      const allOffers = Array.isArray(result.offer_slots) ? result.offer_slots : [];
+      const standard = Array.isArray(result.standard_slots) ? result.standard_slots : [];
+      const shown = (allOffers.length ? allOffers : standard).slice(0, 3);
+      state.offeredVoiceSlots = shown.map((slot) => ({ date: String(slot?.date || ''), window: slot?.window || {} }));
+      state.slotSelectionConfirmed = shown.length <= 1;
+      state.slotClarificationPending = false;
+    }
     const durationMs = Date.now() - startedAt;
     applyVoicePresentationFromResult(state, result);
     if (state.workflowIntent === 'booking' && ['nbb_get_quote', 'nbb_send_estimate'].includes(name)) {
@@ -3058,6 +3157,30 @@ function handleOpenAIEvent(state, raw) {
       });
 
       updateWorkflowIntentFromTranscript(state, transcript);
+      // Only explicit caller intent may revoke an already-confirmed email.
+      // Model-proposed changes during prepare_booking remain overridden.
+      if (state.confirmedEmail && requestsEmailChange(transcript)) {
+        state.confirmedEmail = '';
+        state.customerEmail = '';
+        if (state.pendingContactConfirmation?.type === 'email') state.pendingContactConfirmation = null;
+        invalidatePreparedBookingForContactChange(state);
+        pushInternalCallContext(state, 'Caller explicitly requested a corrected email. Ask for the replacement if not already provided, confirm it once, and do not reuse the previously confirmed email.');
+      }
+      if (!state.slotSelectionConfirmed && state.offeredVoiceSlots?.length > 1) {
+        if (explicitSlotChoice(transcript, state.offeredVoiceSlots)) {
+          state.slotSelectionConfirmed = true;
+          state.slotClarificationPending = false;
+        } else if (isVagueSlotChoice(transcript)) {
+          state.slotClarificationPending = true;
+          state.conversationCheckpointCounts.ambiguous_slot += 1;
+          queueDeterministicContinuation(
+            state,
+            'There were several arrival windows offered and the caller said only "that" or another vague agreement. Ask exactly one concise question: "Which arrival window would you like—the first, second, or third option?" Do not assume the first option. Wait for an explicit answer.',
+            'arrival_window_clarification'
+          );
+          return;
+        }
+      }
       if (state.bookingPhoneChoiceResolved && state.confirmedPhone && requestsBookingPhoneChange(transcript)) {
         state.bookingPhoneChangeRequested = true;
         pushInternalCallContext(state, 'The CALLER expressly requested a booking phone-number change. The existing confirmed number remains valid until a replacement number is provided and confirmed once. The next voice_set_booking_phone may request that replacement.');
@@ -3077,6 +3200,7 @@ function handleOpenAIEvent(state, raw) {
       }
 
       if (state.serviceCollectionClosed && isExplicitServiceAdditionOrChange(transcript)) {
+        state.conversationCheckpointCounts.service_reopen += 1;
         state.serviceCollectionClosed = false;
         state.serviceCollectionSignature = '';
         state.awaitingAdditionalServiceDecision = false;
@@ -3177,6 +3301,7 @@ function handleOpenAIEvent(state, raw) {
         if (pending.type === 'email') {
           state.customerEmail = normalizedEmail(pending.value);
           state.confirmedEmail = state.customerEmail;
+          state.conversationCheckpointCounts.contact_confirmed += 1;
           invalidatePreparedBookingForContactChange(state);
         } else if (pending.type === 'phone') {
           state.customerPhone = normalizedPhone(pending.value);
@@ -3265,6 +3390,13 @@ function handleOpenAIEvent(state, raw) {
         content: transcript,
         event: 'voice_agent_message',
       });
+      // A model-generated duplicate readback cannot reopen the authoritative
+      // contact checkpoint. Record only a content-free diagnostic for staging;
+      // never repeat the confirmation in a deterministic continuation.
+      if (state.confirmedEmail && emailFromAssistantConfirmation(transcript) === state.confirmedEmail) {
+        state.conversationCheckpointCounts.stale_email_repeat += 1;
+        pushInternalCallContext(state, 'The email was ALREADY confirmed by the caller. Do not ask again. Continue booking preparation or the next missing required booking field.');
+      }
       // The model may spontaneously ask for an email confirmation before
       // nbb_prepare_booking. Capture that exact spoken readback, so the user's
       // one affirmative answer satisfies the existing deterministic lock.
@@ -3525,7 +3657,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.46' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.47' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });

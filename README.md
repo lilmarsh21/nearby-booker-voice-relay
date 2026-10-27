@@ -95,3 +95,13 @@ See RELAY-v0.2.45-VOICE-QUALITY-REPAIR.txt.
 - After booking phone confirmation, the next prompt explicitly asks for the missing customer name, then remaining notes or booking preparation and final authorization.
 - No Twilio, OpenAI model, Proxy, NBB, availability, service selection, pricing, quote, booking-write, SMS or email integration contracts changed.
 - Local simulated regression tests do not establish the exact hidden tool sequence on a production call. Review the private troubleshooting timeline for that.
+
+## v0.2.47 targeted Voice workflow and usage observability (2026-10-27)
+
+- Prevent notes text from reopening already-closed optional service selection while allowing explicit service additions.
+- Treat ambiguous multiple-window acceptances as unselected until the caller identifies a specific option. Booking preparation enforces this requirement, not just spoken guidance.
+- Retain one confirmed email in Relay state, permit explicit corrections, and count stale duplicate email readbacks without logging the address.
+- Reduce separate standalone acknowledgements through a short delivery instruction, and report per-call uncached input, cache share and highest input-token response reasons.
+- No model switch, Twilio integration change, Proxy update, NBB edit, or dollar-cost guarantee.
+
+See `RELAY-v0.2.47-VOICE-STATE-AND-COST-OBSERVABILITY.txt` for regression scope and staging steps.
