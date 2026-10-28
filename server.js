@@ -352,6 +352,17 @@ function explicitEstimateDeliveryChoice(text) {
 
 function pushInternalCallContext(state, text) {
   if (!text || !state.openaiWs || state.openaiWs.readyState !== WebSocket.OPEN) return;
+  // The model keeps conversation items for the entire call. Re-inserting an
+  // *identical* state message adds billable input context to later responses;
+  // never suppress genuinely changed contact/service/booking information.
+  if (!state.sentInternalContext) state.sentInternalContext = new Set();
+  if (state.sentInternalContext.has(text)) {
+    state.duplicateInternalContextsAvoided = (state.duplicateInternalContextsAvoided || 0) + 1;
+    return;
+  }
+  state.sentInternalContext.add(text);
+  // Bounded in-memory dedupe only. Never store caller details across calls.
+  if (state.sentInternalContext.size > 96) state.sentInternalContext.delete(state.sentInternalContext.values().next().value);
   safeSend(state.openaiWs, {
     type: 'conversation.item.create',
     item: {
@@ -550,7 +561,12 @@ function captureRealtimeUsage(state, event) {
   const outputDetails = usage.output_token_details || usage.output_tokens_details || {};
   const u = state.realtimeUsage;
   u.responses += 1;
-  const reason = String(state.activeResponseReason || 'unknown').replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
+  // Realtime can create responses automatically, independently of Relay's
+  // response.create requests. The old shared activeResponseReason mislabelled
+  // usage after another response started. Prefer this completed response's ID.
+  const responseId = String(event?.response?.id || '');
+  const matchedReason = responseId ? state.responseReasonById?.get(responseId) : '';
+  const reason = String(matchedReason || (!responseId ? state.activeResponseReason : 'unattributed')).replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
   if (!u.byReason || typeof u.byReason !== 'object') u.byReason = {};
   const row = u.byReason[reason] || { responses: 0, input: 0, cached: 0, output: 0 };
   row.responses += 1;
@@ -571,7 +587,7 @@ function captureRealtimeUsage(state, event) {
 
   log('debug', 'OpenAI Realtime response usage', {
     callSid: state.callSid,
-    reason: state.activeResponseReason || '',
+    reason,
     inputTokens: Number(usage.input_tokens || 0),
     inputTextTokens: Number(inputDetails.text_tokens || 0),
     inputAudioTokens: Number(inputDetails.audio_tokens || 0),
@@ -597,8 +613,23 @@ function realtimeUsageDiagnostic(state) {
     uncached_input: Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedTokens || 0)),
     cached_input_percent: Number(u.inputTokens || 0) ? Math.round(100 * Number(u.cachedTokens || 0) / Number(u.inputTokens || 0)) : 0,
     average_input_per_response: Number(u.responses || 0) ? Math.round(Number(u.inputTokens || 0) / Number(u.responses || 0)) : 0,
+    // Summary first: transcript screens can truncate long diagnostic messages.
+    estimated_openai_usd: state.model === 'gpt-realtime-2.1'
+      ? Number((((Math.max(0, Number(u.inputTextTokens || 0) - Number(u.cachedTextTokens || 0)) * 4)
+          + (Number(u.cachedTextTokens || 0) * 0.4)
+          + (Math.max(0, Number(u.inputAudioTokens || 0) - Number(u.cachedAudioTokens || 0)) * 32)
+          + (Number(u.cachedAudioTokens || 0) * 0.4)
+          + (Number(u.outputTextTokens || 0) * 24)
+          + (Number(u.outputAudioTokens || 0) * 64)) / 1000000).toFixed(4))
+      : null,
+    estimated_cost_excludes: 'Twilio/transcription/other modalities',
+    progress_model_requests: Number(state.progressModelRequests || 0),
+    internal_context_duplicates_skipped: Number(state.duplicateInternalContextsAvoided || 0),
+    duplicate_response_requests_skipped: Number(state.duplicateResponseRequestsAvoided || 0),
+    response_started_explicit: Number(state.explicitResponseStarts || 0),
+    response_started_automatic: Number(state.automaticResponseStarts || 0),
     // No contents, caller identifiers, contact values or credentials in this telemetry.
-    response_reasons: Object.fromEntries(Object.entries(u.byReason || {}).sort((a,b) => b[1].input - a[1].input).slice(0, 8)),
+    response_reasons: Object.fromEntries(Object.entries(u.byReason || {}).sort((a,b) => b[1].input - a[1].input).slice(0, 5)),
     checkpoint_counts: state.conversationCheckpointCounts || {},
     output_tokens: Number(u.outputTokens || 0),
     output_text: Number(u.outputTextTokens || 0),
@@ -1246,6 +1277,14 @@ function createConnectionState(twilioWs) {
     responseActive: false,
     responseRequestPending: false,
     activeResponseReason: '',
+    pendingResponseReason: '',
+    responseReasonById: new Map(),
+    explicitResponseStarts: 0,
+    automaticResponseStarts: 0,
+    progressModelRequests: 0,
+    duplicateInternalContextsAvoided: 0,
+    duplicateResponseRequestsAvoided: 0,
+    sentInternalContext: new Set(),
     realtimeUsage: {
       responses: 0,
       totalTokens: 0,
@@ -2046,6 +2085,12 @@ function requestModelResponse(state, instructions = '', reason = 'normal', watch
     return false;
   }
   if (state.responseActive || state.responseRequestPending) {
+    if (state.queuedResponseInstructions === instructions
+        && state.queuedResponseReason === reason
+        && state.queuedResponseCallerTurn === Number(state.callerTurn || 0)) {
+      state.duplicateResponseRequestsAvoided += 1;
+      return false;
+    }
     state.queuedResponseInstructions = instructions;
     state.queuedResponseReason = reason;
     state.queuedResponseCallerTurn = Number(state.callerTurn || 0);
@@ -2058,7 +2103,9 @@ function requestModelResponse(state, instructions = '', reason = 'normal', watch
   const response = {};
   if (effectiveInstructions) response.instructions = effectiveInstructions;
   state.activeResponseReason = String(reason || 'normal');
+  state.pendingResponseReason = state.activeResponseReason;
   safeSend(state.openaiWs, { type: 'response.create', response });
+  if (reason === 'tool_progress') state.progressModelRequests += 1;
   state.responseRequestPending = true;
   if (watchForAudio) scheduleContinuationWatchdog(state, instructions, reason);
   return true;
@@ -2755,11 +2802,12 @@ async function executeNbbTool(state, name, callId, args = {}) {
     tool_phase: 'start',
   });
 
-  // v0.2.45: reassure callers earlier during long tools (6-9 s first notice,
-  // 9-12 s thereafter). Timers stop when the tool settles; never invent slots.
-  // A progress response only starts when the caller/model is not speaking.
+  // Cost-control: retain the early 6-9 second reassurance but don't create a
+  // second full-model response merely because an ordinary 15-20 second search
+  // has not quite finished. A longer-running tool still gets repeat reassurance
+  // every 12 seconds, with existing caller-speech/AI-playback guards intact.
   const progressDelay = Math.max(6000, Math.min(9000, Number(state.rules?.dead_air_seconds || 7) * 1000));
-  const progressInterval = Math.max(9000, Math.min(12000, progressDelay));
+  const progressInterval = 12000;
   const progressKey = callId || Symbol('nbb-tool-progress');
   let progressTimer = null;
   let progressSettled = false;
@@ -3056,6 +3104,13 @@ function handleOpenAIEvent(state, raw) {
       state.responseRequestPending = false;
       return;
     }
+    const id = String(event?.response?.id || '');
+    const explicit = Boolean(state.responseRequestPending);
+    const reason = explicit ? String(state.pendingResponseReason || 'explicit_unknown') : 'automatic';
+    if (id) state.responseReasonById.set(id, reason);
+    if (explicit) state.explicitResponseStarts += 1;
+    else state.automaticResponseStarts += 1;
+    state.pendingResponseReason = '';
     state.responseActive = true;
     state.responseRequestPending = false;
     state.responseHadAudio = false;
@@ -3512,6 +3567,7 @@ function handleOpenAIEvent(state, raw) {
 
   if (type === 'response.done' || type === 'response.cancelled' || type === 'response.failed') {
     if (type === 'response.done') captureRealtimeUsage(state, event);
+    if (event?.response?.id) state.responseReasonById.delete(String(event.response.id));
     state.responseActive = false;
     state.responseRequestPending = false;
     state.aiAudioActive = false;
@@ -3657,7 +3713,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.47' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.48' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
