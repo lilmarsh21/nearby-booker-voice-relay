@@ -8,8 +8,6 @@ const PROXY_BASE = (process.env.GEOVEE_PROXY_VOICE_BASE_URL || 'https://sub.geov
 const RELAY_SECRET = String(process.env.GEOVEE_VOICE_RELAY_SECRET || '').trim();
 const OPENAI_WS_BASE = String(process.env.OPENAI_REALTIME_WS_BASE || 'wss://api.openai.com/v1/realtime').trim();
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
-// Per-call memory only; set 0 to restore the legacy model-generated progress path.
-const REUSE_PROGRESS_AUDIO = String(process.env.RELAY_REUSE_PROGRESS_AUDIO || '1') !== '0';
 
 function log(level, message, data = {}) {
   const ranks = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -162,7 +160,7 @@ function observeInboundAudio(state, payload) {
   // While the AI is talking, inbound audio is normally the best sample of the
   // caller's ambient environment. Learn that floor conservatively and do not
   // chase a sudden spike that may actually be the caller beginning to speak.
-  const aiAudible = state.responseActive || state.progressPlaybackActive || (now - state.lastAiAudioAt) < 1800;
+  const aiAudible = state.responseActive || (now - state.lastAiAudioAt) < 1800;
   if (!aiAudible || state.autoSpeechStartedAt) return;
   if (state.autoNoiseFloorRms <= 0) {
     state.autoNoiseFloorRms = rms;
@@ -236,7 +234,7 @@ function confirmAutomaticBargeIn(state) {
   clearContinuationWatchdog(state);
   state.continuationRetryCount = 0;
 
-  const aiAudible = state.responseActive || state.progressPlaybackActive || (now - state.lastAiAudioAt) < 1800;
+  const aiAudible = state.responseActive || (now - state.lastAiAudioAt) < 1800;
   if (aiAudible) {
     state.autoBargeTriggered = true;
     safeSend(state.twilioWs, { event: 'clear', streamSid: state.streamSid });
@@ -626,10 +624,9 @@ function realtimeUsageDiagnostic(state) {
       : null,
     estimated_cost_excludes: 'Twilio/transcription/other modalities',
     progress_model_requests: Number(state.progressModelRequests || 0),
-    progress_audio_replays: Number(state.progressAudioReplays || 0),
-    progress_audio_cached_phrases: Number(state.progressAudioCache?.size || 0),
     internal_context_duplicates_skipped: Number(state.duplicateInternalContextsAvoided || 0),
     duplicate_response_requests_skipped: Number(state.duplicateResponseRequestsAvoided || 0),
+    voice_timing_ms: voiceTimingDiagnostic(state),
     response_started_explicit: Number(state.explicitResponseStarts || 0),
     response_started_automatic: Number(state.automaticResponseStarts || 0),
     // No contents, caller identifiers, contact values or credentials in this telemetry.
@@ -751,46 +748,79 @@ function isExplicitSubmitBookingApproval(text) {
   return /^(?:submit|submit it|submit this|submit the appointment|please submit|please submit it|send the booking|send the appointment|go ahead and submit|go ahead submit|book this appointment|book the appointment|book it now)$/.test(t);
 }
 
-function emailFromAssistantConfirmation(text) {
-  // A spontaneous model read-back sometimes spells the local part with spaces:
-  // "h c 3 5 0 6 at gmail dot com". The old substring regex silently captured
-  // only "6@gmail.com", so the caller's YES locked the WRONG address. Parse the
-  // complete left side instead of searching for a trailing valid substring.
-  const source = String(text || '').trim();
-  if (!/(?:is that correct|is that right|please confirm|can you confirm|correct\s*\?)/i.test(source)) return '';
-  const questionStart = source.search(/\b(?:is that correct|is that right|can you confirm|correct\s*\?)\b/i);
-  const candidateText = (questionStart > 0 ? source.slice(0, questionStart) : source).replace(/[?!.]+\s*$/, '').trim();
-  const at = candidateText.match(/\s+at\s+|@/i);
-  if (!at || at.index === undefined) return '';
-  let before = candidateText.slice(0, at.index).trim();
-  const after = candidateText.slice(at.index + at[0].length).trim();
-  // Remove only a known introductory phrase. Unknown leading text makes this
-  // read-back ambiguous; NEVER salvage an email by taking its last few chars.
-  const prefixes = [
-    /^(?:please\s+)?confirm\s+(?:the\s+|your\s+)?email(?:\s+address)?\s*(?:(?:is|as)\s*)?[:\-]?\s*/i,
-    /^(?:i\s+have|i(?:'ve| have)\s+got|we\s+have)\s+(?:(?:your|the)\s+email(?:\s+address)?\s+(?:is|as)\s+)?/i,
-    /^(?:your|the|my)\s+email(?:\s+address)?\s+(?:is|as)\s+/i,
-  ];
-  let foundIntroduction = false;
-  for (const prefix of prefixes) {
-    if (prefix.test(before)) { before = before.replace(prefix, ''); foundIntroduction = true; break; }
+// Normalize a spoken email readback without guessing missing characters.
+// Every token in an explicitly spelled local-part must be a letter/digit,
+// a number word or permitted punctuation. Otherwise leave it unverified.
+function spokenEmailReadbackPart(value, localPart = false) {
+  const numberWords = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+  const punctuation = { dot: '.', period: '.', underscore: '_', dash: '-', hyphen: '-', plus: '+' };
+  const words = String(value || '').toLowerCase().trim()
+    .replace(/[.,;:!?]+$/g, '')
+    .replace(/\s*[.](?=\s|$)/g, ' dot ')
+    .split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 32) return '';
+  const mapped = [];
+  for (const word of words) {
+    if (Object.prototype.hasOwnProperty.call(numberWords, word)) mapped.push(numberWords[word]);
+    else if (Object.prototype.hasOwnProperty.call(punctuation, word)) mapped.push(punctuation[word]);
+    else if (/^[a-z0-9._%+\-]+$/.test(word)) mapped.push(word);
+    else return '';
   }
-  before = before.trim();
-  if (!before || /[^a-z0-9._%+\-\s]/i.test(before)) return '';
-  const spokenDigits = { zero:'0', one:'1', two:'2', three:'3', four:'4', five:'5', six:'6', seven:'7', eight:'8', nine:'9' };
-  const parts = before.split(/\s+/).filter(Boolean);
-  // Without a recognized introduction, accept only one compact address token
-  // or individually spelled letters/digits; never merge an unknown sentence.
-  if (!foundIntroduction && parts.length > 1 && parts.some((part) => part.length > 1
-      && !(part.toLowerCase() in spokenDigits))) return '';
-  // No single character can be accidentally taken from the END of a sentence.
-  const spokenPunctuation = { dot:'.', period:'.', underscore:'_', dash:'-', hyphen:'-', plus:'+' };
-  const local = parts.map((part) => spokenDigits[part.toLowerCase()] ?? spokenPunctuation[part.toLowerCase()] ?? part).join('').toLowerCase();
-  const domainParts = after.match(/^([a-z0-9-]+(?:(?:\s+dot\s+|\s*\.\s*)[a-z0-9-]+)+)(?:$|\s|[?.!])/i);
-  if (!domainParts) return '';
-  const domain = domainParts[1].replace(/\s+dot\s+|\s*\.\s*/gi, '.').toLowerCase();
-  const email = `${local}@${domain}`;
-  if (email.length > 254 || !/^[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(email)) return '';
+  // Multiple ordinary words can be an incidental sentence rather than an
+  // email address. Treat only single-character spellings/number words and
+  // explicit punctuation as safely joinable across word boundaries.
+  if (localPart && words.length > 1) {
+    const hasFullWord = words.some((w) => w.length > 1
+      && !Object.prototype.hasOwnProperty.call(numberWords, w)
+      && !Object.prototype.hasOwnProperty.call(punctuation, w));
+    // 'john dot smith' is a legitimate spelling; 'please confirm john'
+    // is not. Multiple full words require explicit spoken separators.
+    const hasSpokenSeparator = words.some((w) => Object.prototype.hasOwnProperty.call(punctuation, w));
+    if (hasFullWord && !hasSpokenSeparator) return '';
+  }
+  return mapped.join('');
+}
+
+function emailFromAssistantConfirmation(text) {
+  // Require an actual confirmation question. Never infer caller verification
+  // from a plain statement of an email address.
+  const source = String(text || '').trim();
+  const question = /\b(?:is (?:that|this|the email) (?:correct|right)|is that the (?:correct|right) (?:email|address)|can you confirm|please confirm|does that (?:sound|look) right)\b|\bcorrect\s*\?/i;
+  if (!question.test(source)) return '';
+  // Discard trailing question, not the email that precedes it. The leading
+  // 'please confirm' form is intentionally supported too.
+  const parts = source.split(/\b(?:is (?:that|this|the email) (?:correct|right)|is that the (?:correct|right) (?:email|address)|does that (?:sound|look) right)\b|\bcorrect\s*\?/i);
+  let spoken = parts[0].toLowerCase().replace(/[—–]/g, ' ').trim();
+  // Recognize the full readback prefix; extracting a substring beginning at
+  // just the last digit would otherwise let '6 at gmail dot com' confirm a
+  // partially parsed email.
+  const intro = /\b(?:email(?: address)?(?: i have| is| as)?|i have|email address|your email(?: address)?(?: is| as)?)\b\s*[:,-]?\s*/gi;
+  const intros = [...spoken.matchAll(intro)];
+  if (intros.length) {
+    const last = intros[intros.length - 1];
+    spoken = spoken.slice(last.index + last[0].length);
+  } else {
+    spoken = spoken.replace(/^\s*(?:please\s+confirm\s+)?/, '');
+  }
+  spoken = spoken.replace(/^[\s:,-]+|[\s:,.!?-]+$/g, '').trim();
+  let local = '', domain = '';
+  if (spoken.includes('@')) {
+    const at = spoken.indexOf('@');
+    if (spoken.indexOf('@', at + 1) !== -1) return '';
+    local = spoken.slice(0, at);
+    domain = spoken.slice(at + 1);
+  } else {
+    const at = spoken.match(/\s+at\s+/i);
+    if (!at) return '';
+    const index = spoken.indexOf(at[0]);
+    local = spoken.slice(0, index);
+    domain = spoken.slice(index + at[0].length);
+  }
+  const normalizedLocal = spokenEmailReadbackPart(local, true);
+  const normalizedDomain = spokenEmailReadbackPart(domain);
+  const email = `${normalizedLocal}@${normalizedDomain}`;
+  if (!/^[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(email)) return '';
+  if (email.length > 254 || normalizedLocal.length > 64) return '';
   return email;
 }
 
@@ -1233,6 +1263,26 @@ function asksForEmailMessage(text) {
   return words.length <= 8 && (words.includes('email') || (words.includes('e') && words.includes('mail')));
 }
 
+
+// Content-free latency accounting. These samples change no response or
+// playback scheduling; the final usage event reports totals and worst cases.
+function recordVoiceLatency(state, category, durationMs) {
+  if (!state?.voiceTiming || !Number.isFinite(durationMs) || durationMs < 0 || durationMs > 600000) return;
+  const row = state.voiceTiming[category] || { samples: 0, total_ms: 0, max_ms: 0, over_5s: 0 };
+  row.samples += 1;
+  row.total_ms += Math.round(durationMs);
+  row.max_ms = Math.max(row.max_ms, Math.round(durationMs));
+  if (durationMs >= 5000) row.over_5s += 1;
+  state.voiceTiming[category] = row;
+}
+
+function voiceTimingDiagnostic(state) {
+  return Object.fromEntries(Object.entries(state?.voiceTiming || {}).map(([name, row]) => [name, {
+    count: row.samples, average_ms: row.samples ? Math.round(row.total_ms / row.samples) : 0,
+    max_ms: row.max_ms, over_5s: row.over_5s
+  }]));
+}
+
 function createConnectionState(twilioWs) {
   return {
     twilioWs,
@@ -1312,17 +1362,15 @@ function createConnectionState(twilioWs) {
     responseRequestPending: false,
     activeResponseReason: '',
     pendingResponseReason: '',
+    explicitResponseRequestedAt: 0,
+    activeResponseTiming: null,
+    lastToolCompletedAt: 0,
+    voiceTiming: {},
+    playbackMarkStartedAt: new Map(),
     responseReasonById: new Map(),
     explicitResponseStarts: 0,
     automaticResponseStarts: 0,
     progressModelRequests: 0,
-    progressAudioReplays: 0,
-    progressAudioCache: new Map(),
-    progressAudioCapture: null,
-    pendingProgressCategory: '',
-    progressPlaybackActive: false,
-    progressPlaybackMark: '',
-    progressPlaybackTimer: null,
     duplicateInternalContextsAvoided: 0,
     duplicateResponseRequestsAvoided: 0,
     sentInternalContext: new Set(),
@@ -1608,12 +1656,6 @@ async function enterVoiceMessageMode(state) {
   // Twilio is cleared below, so discard its local playback bookkeeping too;
   // late marks from that cleared audio are intentionally ignored.
   state.pendingPlaybackMarks.clear();
-  if (state.progressPlaybackTimer) clearTimeout(state.progressPlaybackTimer);
-  state.progressPlaybackTimer = null;
-  state.progressPlaybackActive = false;
-  state.progressPlaybackMark = '';
-  state.progressAudioCapture = null;
-  state.progressAudioCache.clear();
   state.aiPlaybackPending = false;
   state.aiAudioActive = false;
   state.responseHadAudio = false;
@@ -1807,69 +1849,12 @@ async function executeSilenceHangup(state) {
   try { if (state.twilioWs?.readyState === WebSocket.OPEN) state.twilioWs.close(1000, 'Silence timeout'); } catch {}
 }
 
-// Generated progress speech is already G.711 mu-law, 8 kHz, the exact audio
-// format sent to Twilio. Save ONLY a short, verified progress phrase in RAM for
-// the CURRENT call; reuse that same voice for the same tool kind later. Never
-// cache business results, caller speech, or audio across sessions.
-function progressAudioCategory(tool) {
-  if (tool === 'nbb_get_availability' || tool === 'nbb_get_reschedule_availability') return 'availability';
-  if (tool === 'nbb_commit_booking') return 'commit';
-  if (tool === 'nbb_prepare_booking') return 'prepare';
-  if (tool === 'nbb_validate_address') return 'address';
-  return '';
-}
-
-function validProgressSpeech(category, transcript) {
-  const value = String(transcript || '').toLowerCase().replace(/[’']/g, '').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
-  const allowed = {
-    availability: 'im still checking the available appointment times',
-    commit: 'im submitting your appointment request now',
-    prepare: 'im getting your appointment details ready',
-    address: 'im still checking that address',
-  };
-  return Boolean(category && value && value === allowed[category]);
-}
-
-function replayCachedProgress(state, category) {
-  if (!REUSE_PROGRESS_AUDIO || !category || state.ended || state.messageMode || state.callerSpeechActive
-      || state.responseActive || state.responseRequestPending || state.aiPlaybackPending
-      || !state.streamSid || !state.twilioWs || state.twilioWs.readyState !== WebSocket.OPEN) return false;
-  const cached = state.progressAudioCache?.get(category);
-  if (!cached || !cached.audio || !cached.text) return false;
-  // No model request and no extra transcript context, only the exact verified
-  // PCMU bytes the current caller heard in this same call.
-  safeSend(state.twilioWs, { event: 'media', streamSid: state.streamSid, media: { payload: cached.audio } });
-  state.playbackMarkSeq += 1;
-  const mark = `nbb_cached_progress_${state.playbackMarkSeq}`;
-  state.progressPlaybackMark = mark;
-  state.progressPlaybackActive = true;
-  state.pendingPlaybackMarks.add(mark);
-  state.aiPlaybackPending = true;
-  state.lastAiAudioAt = Date.now();
-  clearSilenceHangupTimer(state);
-  safeSend(state.twilioWs, { event: 'mark', streamSid: state.streamSid, mark: { name: mark } });
-  // Safety: a lost Twilio mark must not strand the response continuation.
-  if (state.progressPlaybackTimer) clearTimeout(state.progressPlaybackTimer);
-  state.progressPlaybackTimer = setTimeout(() => {
-    if (!state.progressPlaybackActive || state.progressPlaybackMark !== mark) return;
-    state.progressPlaybackActive = false;
-    state.progressPlaybackMark = '';
-    state.pendingPlaybackMarks.delete(mark);
-    state.progressPlaybackTimer = null;
-    state.aiPlaybackPending = state.pendingPlaybackMarks.size > 0;
-    if (!state.callerSpeechActive) flushQueuedResponse(state);
-    armSilenceHangupFromLastActivity(state);
-  }, 12000);
-  state.progressAudioReplays = Number(state.progressAudioReplays || 0) + 1;
-  reportVoiceEvent(state, { kind: 'message', role: 'assistant', content: cached.text, event: 'voice_agent_message' });
-  return true;
-}
-
 function sendTwilioPlaybackMark(state) {
   if (!state.twilioWs || state.twilioWs.readyState !== WebSocket.OPEN || !state.streamSid) return false;
   state.playbackMarkSeq += 1;
   const name = `nbb_ai_playback_${state.playbackMarkSeq}`;
   state.pendingPlaybackMarks.add(name);
+  if (state.playbackMarkStartedAt) state.playbackMarkStartedAt.set(name, Date.now());
   state.aiPlaybackPending = true;
   safeSend(state.twilioWs, {
     event: 'mark',
@@ -1883,13 +1868,9 @@ function handleTwilioPlaybackMark(state, name) {
   const markName = String(name || '');
   if (!markName || !state.pendingPlaybackMarks.has(markName)) return false;
   state.pendingPlaybackMarks.delete(markName);
-  const completedCachedProgress = markName === state.progressPlaybackMark;
-  if (completedCachedProgress) {
-    state.progressPlaybackActive = false;
-    state.progressPlaybackMark = '';
-    if (state.progressPlaybackTimer) clearTimeout(state.progressPlaybackTimer);
-    state.progressPlaybackTimer = null;
-  }
+  const sentAt = state.playbackMarkStartedAt?.get(markName);
+  if (sentAt) recordVoiceLatency(state, 'twilio_mark_roundtrip', Date.now() - sentAt);
+  state.playbackMarkStartedAt?.delete(markName);
   if (state.pendingPlaybackMarks.size > 0) return true;
 
   // Twilio returns this mark only after all outbound media queued before it has
@@ -1904,7 +1885,6 @@ function handleTwilioPlaybackMark(state, name) {
     return true;
   }
   armSilenceHangupFromLastActivity(state);
-  if (completedCachedProgress && !state.callerSpeechActive) flushQueuedResponse(state);
   return true;
 }
 
@@ -2197,7 +2177,7 @@ function requestModelResponse(state, instructions = '', reason = 'normal', watch
   if (!responseAllowedByDeterministicGate(state, reason)) {
     return false;
   }
-  if (state.responseActive || state.responseRequestPending || state.progressPlaybackActive) {
+  if (state.responseActive || state.responseRequestPending) {
     if (state.queuedResponseInstructions === instructions
         && state.queuedResponseReason === reason
         && state.queuedResponseCallerTurn === Number(state.callerTurn || 0)) {
@@ -2217,6 +2197,7 @@ function requestModelResponse(state, instructions = '', reason = 'normal', watch
   if (effectiveInstructions) response.instructions = effectiveInstructions;
   state.activeResponseReason = String(reason || 'normal');
   state.pendingResponseReason = state.activeResponseReason;
+  state.explicitResponseRequestedAt = Date.now();
   safeSend(state.openaiWs, { type: 'response.create', response });
   if (reason === 'tool_progress') state.progressModelRequests += 1;
   state.responseRequestPending = true;
@@ -2954,11 +2935,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
               'Say only: "This is taking a little longer, but I’m still checking." Do not claim a result.',
               'Say only: "I’m still working on those options." Do not claim a result.',
             ];
-      const category = progressAudioCategory(name);
-      if (!replayCachedProgress(state, category)) {
-        const started = requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
-        if (started && category) state.pendingProgressCategory = category;
-      }
+      requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
       progressCount += 1;
     }
     scheduleToolProgress(progressInterval);
@@ -2984,6 +2961,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
       state.slotClarificationPending = false;
     }
     const durationMs = Date.now() - startedAt;
+    state.lastToolCompletedAt = Date.now();
     applyVoicePresentationFromResult(state, result);
     if (state.workflowIntent === 'booking' && ['nbb_get_quote', 'nbb_send_estimate'].includes(name)) {
       state.quoteSideRequestAt = 0;
@@ -3109,6 +3087,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
     );
   } catch (error) {
     stopToolProgress();
+    state.lastToolCompletedAt = Date.now();
     const durationMs = Date.now() - startedAt;
 
     if (name === 'nbb_get_quote' && ['nbb_voice_quotes_disabled', 'geovee_voice_capability_disabled'].includes(String(error?.code || ''))) {
@@ -3227,10 +3206,10 @@ function handleOpenAIEvent(state, raw) {
     if (id) state.responseReasonById.set(id, reason);
     if (explicit) state.explicitResponseStarts += 1;
     else state.automaticResponseStarts += 1;
-    if (explicit && reason === 'tool_progress' && state.pendingProgressCategory && REUSE_PROGRESS_AUDIO) {
-      state.progressAudioCapture = { responseId: id, category: state.pendingProgressCategory, text: '', chunks: [], bytes: 0, invalid: false };
-    }
-    state.pendingProgressCategory = '';
+    const now = Date.now();
+    if (explicit && state.explicitResponseRequestedAt) recordVoiceLatency(state, 'explicit_request_to_created', now - state.explicitResponseRequestedAt);
+    state.activeResponseTiming = { createdAt: now, firstAudioSeen: false, requestedAt: explicit ? state.explicitResponseRequestedAt : 0 };
+    state.explicitResponseRequestedAt = 0;
     state.pendingResponseReason = '';
     state.responseActive = true;
     state.responseRequestPending = false;
@@ -3246,6 +3225,17 @@ function handleOpenAIEvent(state, raw) {
     if (state.messageMode && !state.messageResponsePhase) {
       safeSend(state.openaiWs, { type: 'response.cancel' });
       return;
+    }
+    if (state.activeResponseTiming && !state.activeResponseTiming.firstAudioSeen) {
+      const now = Date.now();
+      const timing = state.activeResponseTiming;
+      timing.firstAudioSeen = true;
+      recordVoiceLatency(state, 'response_created_to_first_audio', now - timing.createdAt);
+      if (timing.requestedAt) recordVoiceLatency(state, 'explicit_request_to_first_audio', now - timing.requestedAt);
+      if (state.lastToolCompletedAt) {
+        recordVoiceLatency(state, 'last_tool_complete_to_first_audio', now - state.lastToolCompletedAt);
+        state.lastToolCompletedAt = 0;
+      }
     }
     state.lastAiAudioAt = Date.now();
     state.aiAudioActive = true;
@@ -3267,13 +3257,6 @@ function handleOpenAIEvent(state, raw) {
         realtime_event: type,
         diagnostic_message: `Opening greeting audio began; ${state.droppedStartupAudioFrames} startup caller-audio frames were suppressed.`,
       });
-    }
-    if (REUSE_PROGRESS_AUDIO && state.progressAudioCapture && !state.progressAudioCapture.invalid
-        && (!event.response_id || String(event.response_id) === state.progressAudioCapture.responseId)) {
-      const cap = state.progressAudioCapture;
-      const bytes = Buffer.byteLength(String(event.delta), 'base64');
-      if (cap.bytes + bytes > 65000) { cap.invalid = true; cap.chunks = []; }
-      else { cap.chunks.push(String(event.delta)); cap.bytes += bytes; }
     }
     safeSend(state.twilioWs, { event: 'media', streamSid: state.streamSid, media: { payload: event.delta } });
     return;
@@ -3553,9 +3536,6 @@ function handleOpenAIEvent(state, raw) {
   // Store the spoken AI text, never the audio, and never write the transcript to Render logs.
   if (type === 'response.output_audio_transcript.done' || type === 'response.audio_transcript.done') {
     const transcript = String(event.transcript || '').trim();
-    if (state.progressAudioCapture && (!event.response_id || String(event.response_id) === state.progressAudioCapture.responseId)) {
-      state.progressAudioCapture.text = transcript;
-    }
     if (state.messageMode) {
       if (transcript && state.messageResponsePhase) {
         reportVoiceEvent(state, {
@@ -3697,17 +3677,9 @@ function handleOpenAIEvent(state, raw) {
   }
 
   if (type === 'response.done' || type === 'response.cancelled' || type === 'response.failed') {
-    const cap = state.progressAudioCapture;
-    if (cap && (!event?.response?.id || String(event.response.id) === cap.responseId)) {
-      if (type === 'response.done' && (!event.response.status || event.response.status === 'completed')
-          && !cap.invalid && cap.bytes >= 1000 && validProgressSpeech(cap.category, cap.text)) {
-        const audio = Buffer.concat(cap.chunks.map((chunk) => Buffer.from(chunk, 'base64'))).toString('base64');
-        if (audio) state.progressAudioCache.set(cap.category, { audio, text: cap.text });
-      }
-      state.progressAudioCapture = null;
-    }
     if (type === 'response.done') captureRealtimeUsage(state, event);
     if (event?.response?.id) state.responseReasonById.delete(String(event.response.id));
+    state.activeResponseTiming = null;
     state.responseActive = false;
     state.responseRequestPending = false;
     state.aiAudioActive = false;
@@ -3799,9 +3771,6 @@ async function finishSession(state, disposition = 'ended') {
   clearVoiceMessageSilenceTimer(state);
   for (const timer of state.toolProgressTimers.values()) clearTimeout(timer);
   state.toolProgressTimers.clear();
-  if (state.progressPlaybackTimer) clearTimeout(state.progressPlaybackTimer);
-  state.progressPlaybackTimer = null;
-  state.progressAudioCapture = null;
   if (state.maxTimer) clearTimeout(state.maxTimer);
   const durationSeconds = Math.max(0, Math.round((Date.now() - state.startedAt) / 1000));
 
@@ -3836,7 +3805,6 @@ async function finishSession(state, disposition = 'ended') {
   }
 
   state.ended = true;
-  if (state.progressAudioCache) state.progressAudioCache.clear();
   if (state.openaiWs && (state.openaiWs.readyState === WebSocket.OPEN || state.openaiWs.readyState === WebSocket.CONNECTING)) {
     try { state.openaiWs.close(1000, 'Twilio stream ended'); } catch {}
   }
@@ -3857,7 +3825,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.49' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.50' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
