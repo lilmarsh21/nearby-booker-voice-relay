@@ -9,6 +9,35 @@ const RELAY_SECRET = String(process.env.GEOVEE_VOICE_RELAY_SECRET || '').trim();
 const OPENAI_WS_BASE = String(process.env.OPENAI_REALTIME_WS_BASE || 'wss://api.openai.com/v1/realtime').trim();
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 
+// Realtime's supported post-instructions context cap. Does not alter the
+// Proxy-owned session instructions, tools, model, or voice. Setting 0 restores
+// v0.2.50's default Realtime context behavior immediately on the next call.
+const CONTEXT_BUDGET_RAW = Number(process.env.RELAY_CONTEXT_BUDGET_TOKENS ?? 8000);
+const CONTEXT_BUDGET_TOKENS = Number.isFinite(CONTEXT_BUDGET_RAW) && CONTEXT_BUDGET_RAW > 0
+  ? Math.max(6000, Math.min(18000, Math.floor(CONTEXT_BUDGET_RAW))) : 0;
+const CONTEXT_RETENTION_RAW = Number(process.env.RELAY_CONTEXT_RETENTION_RATIO ?? 0.75);
+const CONTEXT_RETENTION_RATIO = Number.isFinite(CONTEXT_RETENTION_RAW)
+  ? Math.max(0.60, Math.min(0.90, CONTEXT_RETENTION_RAW)) : 0.75;
+
+function configureRealtimeContextBudget(state) {
+  if (!CONTEXT_BUDGET_TOKENS || !state.openaiWs || state.openaiWs.readyState !== WebSocket.OPEN) return false;
+  const event = {
+    type: 'session.update',
+    session: {
+      type: 'realtime',
+      truncation: {
+        type: 'retention_ratio',
+        retention_ratio: CONTEXT_RETENTION_RATIO,
+        token_limits: { post_instructions: CONTEXT_BUDGET_TOKENS },
+      },
+    },
+  };
+  safeSend(state.openaiWs, event);
+  state.contextBudgetRequested = true;
+  return true;
+}
+
+
 function log(level, message, data = {}) {
   const ranks = { debug: 10, info: 20, warn: 30, error: 40 };
   if ((ranks[level] || 20) < (ranks[LOG_LEVEL] || 20)) return;
@@ -623,6 +652,13 @@ function realtimeUsageDiagnostic(state) {
           + (Number(u.outputAudioTokens || 0) * 64)) / 1000000).toFixed(4))
       : null,
     estimated_cost_excludes: 'Twilio/transcription/other modalities',
+    context_budget: {
+      requested_tokens: CONTEXT_BUDGET_TOKENS,
+      retention_ratio: CONTEXT_BUDGET_TOKENS ? CONTEXT_RETENTION_RATIO : null,
+      server_confirmed: Boolean(state.contextBudgetConfirmed),
+      server_rejected: Boolean(state.contextBudgetRejected),
+      protected_service_rows: Number(state.verifiedServiceRows?.length || 0),
+    },
     progress_model_requests: Number(state.progressModelRequests || 0),
     internal_context_duplicates_skipped: Number(state.duplicateInternalContextsAvoided || 0),
     duplicate_response_requests_skipped: Number(state.duplicateResponseRequestsAvoided || 0),
@@ -1201,6 +1237,18 @@ function explicitSlotChoice(text, offered = []) {
   });
 }
 
+function rememberAcceptedServiceSelection(state, name, args = {}, result = {}) {
+  if (result?.success === false || result?.validated === false) return;
+  if (!['nbb_get_availability', 'nbb_get_quote', 'nbb_prepare_booking', 'nbb_send_estimate'].includes(name)) return;
+  const rows = Array.isArray(args?.services) ? args.services : [];
+  if (!rows.length) return;
+  const validated = rows.map(row => ({
+    service_uuid: String(row?.service_uuid || '').trim().slice(0, 128),
+    quantity: Number(row?.quantity || 0),
+  })).filter(row => row.service_uuid && Number.isFinite(row.quantity) && row.quantity > 0).slice(0, 30);
+  if (validated.length) state.verifiedServiceRows = validated;
+}
+
 function serviceRowsSignature(args = {}) {
   if (!Array.isArray(args?.services)) return '';
   const rows = args.services
@@ -1322,6 +1370,10 @@ function createConnectionState(twilioWs) {
     serviceCollectionClosed: false,
     awaitingAdditionalServiceDecision: false,
     serviceCollectionSignature: '',
+    verifiedServiceRows: [],
+    contextBudgetRequested: false,
+    contextBudgetConfirmed: false,
+    contextBudgetRejected: false,
     awaitingStairWidthChoice: false,
     addressQuestionAskedOnTurn: -1,
     offeredVoiceSlots: [],
@@ -2038,6 +2090,14 @@ function dynamicVoiceResponseRules(state) {
     }
   }
   // Notes-OFF is already a session-level Proxy instruction.
+  // Realtime may truncate old spoken turns under the cost budget. Keep a tiny,
+  // per-call, server-owned record of the last service set ACCEPTED by NBB.
+  // This is context, not booking authority: the caller may subsequently change
+  // services, and the actual tenant scheduler still verifies every selection.
+  if (CONTEXT_BUDGET_TOKENS && (!state.workflowIntent || ['booking', 'estimate'].includes(state.workflowIntent))
+      && Array.isArray(state.verifiedServiceRows) && state.verifiedServiceRows.length) {
+    rules.push(`LAST NBB-VALIDATED SERVICE SELECTION (UUID and quantity, not a final order): ${JSON.stringify(state.verifiedServiceRows)}. Preserve these items and all subsequently requested caller changes; never silently remove variants or quantities. NBB remains authoritative for service eligibility and booking.`);
+  }
   const continuity = customerContinuityInstruction(state);
   if (continuity) rules.push(continuity);
   return rules.join(' ');
@@ -2269,6 +2329,7 @@ async function beginOpenAI(state, sessionToken) {
   openaiWs.on('open', () => {
     const startGreeting = async () => {
       log('info', 'OpenAI Realtime connected', { callSid: state.callSid, model: state.model });
+      configureRealtimeContextBudget(state);
 
       // v0.2.39: one compact, session-persistent delivery cue. This changes only
       // conversational cadence/style; it does not alter tools, business logic,
@@ -2963,6 +3024,7 @@ async function executeNbbTool(state, name, callId, args = {}) {
     const durationMs = Date.now() - startedAt;
     state.lastToolCompletedAt = Date.now();
     applyVoicePresentationFromResult(state, result);
+    rememberAcceptedServiceSelection(state, name, toolArgs, result);
     if (state.workflowIntent === 'booking' && ['nbb_get_quote', 'nbb_send_estimate'].includes(name)) {
       state.quoteSideRequestAt = 0;
       pushInternalCallContext(state, "The caller's pricing/estimate side request was handled. Their active goal remains BOOKING; resume the booking flow unless they explicitly change goals.");
@@ -3186,6 +3248,19 @@ function handleOpenAIEvent(state, raw) {
   let event;
   try { event = JSON.parse(raw.toString()); } catch { return; }
   const type = String(event?.type || '');
+
+  if (type === 'session.updated' && state.contextBudgetRequested) {
+    const trunc = event?.session?.truncation;
+    const active = trunc?.type === 'retention_ratio'
+      && Number(trunc?.token_limits?.post_instructions) === CONTEXT_BUDGET_TOKENS
+      && Math.abs(Number(trunc?.retention_ratio) - CONTEXT_RETENTION_RATIO) < 0.001;
+    state.contextBudgetConfirmed = active;
+    if (!active) state.contextBudgetRejected = true;
+    log(active ? 'info' : 'warn', active ? 'Realtime context budget confirmed' : 'Realtime context budget not confirmed', {
+      callSid: state.callSid, tokenLimit: CONTEXT_BUDGET_TOKENS, retentionRatio: CONTEXT_RETENTION_RATIO,
+    });
+    return;
+  }
 
   if (type === 'response.created') {
     // Realtime occasionally generates a SECOND opening response from startup
@@ -3750,6 +3825,12 @@ function handleOpenAIEvent(state, raw) {
     return;
   }
 
+  if (type === 'error' && state.contextBudgetRequested
+      && /(?:truncat|token_limits|post_instructions|session_update)/i.test(JSON.stringify(event?.error || {}))) {
+    state.contextBudgetRejected = true;
+    state.contextBudgetConfirmed = false;
+  }
+
   if (type === 'error') {
     const code = String(event?.error?.code || 'realtime_error');
     const errorType = String(event?.error?.type || '');
@@ -3825,7 +3906,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.50' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.51' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
