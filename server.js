@@ -12,7 +12,7 @@ const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 // Realtime's supported post-instructions context cap. Does not alter the
 // Proxy-owned session instructions, tools, model, or voice. Setting 0 restores
 // v0.2.50's default Realtime context behavior immediately on the next call.
-const CONTEXT_BUDGET_RAW = Number(process.env.RELAY_CONTEXT_BUDGET_TOKENS ?? 8000);
+const CONTEXT_BUDGET_RAW = Number(process.env.RELAY_CONTEXT_BUDGET_TOKENS ?? 0);
 const CONTEXT_BUDGET_TOKENS = Number.isFinite(CONTEXT_BUDGET_RAW) && CONTEXT_BUDGET_RAW > 0
   ? Math.max(6000, Math.min(18000, Math.floor(CONTEXT_BUDGET_RAW))) : 0;
 const CONTEXT_RETENTION_RAW = Number(process.env.RELAY_CONTEXT_RETENTION_RATIO ?? 0.75);
@@ -660,6 +660,7 @@ function realtimeUsageDiagnostic(state) {
       protected_service_rows: Number(state.verifiedServiceRows?.length || 0),
     },
     progress_model_requests: Number(state.progressModelRequests || 0),
+    progress_stale_responses_suppressed: Number(state.progressStaleResponsesSuppressed || 0),
     internal_context_duplicates_skipped: Number(state.duplicateInternalContextsAvoided || 0),
     duplicate_response_requests_skipped: Number(state.duplicateResponseRequestsAvoided || 0),
     voice_timing_ms: voiceTimingDiagnostic(state),
@@ -830,7 +831,11 @@ function emailFromAssistantConfirmation(text) {
   // Recognize the full readback prefix; extracting a substring beginning at
   // just the last digit would otherwise let '6 at gmail dot com' confirm a
   // partially parsed email.
-  const intro = /\b(?:email(?: address)?(?: i have| is| as)?|i have|email address|your email(?: address)?(?: is| as)?)\b\s*[:,-]?\s*/gi;
+  // Strip only the email-introduction, not guessed local-part characters.
+  // "Please confirm this email for the appointment: hc3506@gmail.com"
+  // is a normal spoken readback and must not leave "for the appointment" in
+  // front of the address. Treat these as formatting, not authorization.
+  const intro = /\b(?:email(?: address)?(?: i have| is| as)?|i have|your email(?: address)?(?: is| as)?)(?:\s+(?:for|on)\s+(?:the|this|your)\s+(?:appointment|booking|estimate))?\b\s*[:,-]?\s*/gi;
   const intros = [...spoken.matchAll(intro)];
   if (intros.length) {
     const last = intros[intros.length - 1];
@@ -858,6 +863,37 @@ function emailFromAssistantConfirmation(text) {
   if (!/^[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(email)) return '';
   if (email.length > 254 || normalizedLocal.length > 64) return '';
   return email;
+}
+
+// Keep the caller's latest *unconfirmed* email candidate independent of the
+// Realtime model's confirmation sentence. A readback cannot be assumed correct
+// merely because it includes a domain; the complete email must match what was
+// heard, and the caller still has to explicitly approve the readback.
+function callerEmailCandidate(text) {
+  const source = String(text || '').trim();
+  const direct = source.match(/\b[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/i);
+  if (direct) return normalizedEmail(direct[0]);
+  const marker = source.match(/\b(?:my|the|an?)\s+email(?: address)?\s+(?:is|as|would be|should be)\s+(.+)$/i)
+    || source.match(/\b(?:email(?: address)?\s*[:,-]?|send\s+it\s+to)\s+(.+)$/i);
+  if (!marker) return '';
+  // Reuse the strict all-character parser. This stores a candidate only, not
+  // a confirmed address, and requires a separate spoken readback + caller yes.
+  return emailFromAssistantConfirmation(`I have ${marker[1].replace(/[.!?]+$/, '')}. Is that correct?`);
+}
+
+function readbackMatchesCallerEmail(utterance, expectedEmail) {
+  const expected = normalizedEmail(expectedEmail);
+  if (!/^[a-z0-9._%+\-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(expected)) return false;
+  const spoken = String(utterance || '').toLowerCase();
+  if (!/\b(?:is\s+(?:that|this|the email)\s+(?:correct|right)|can\s+you\s+confirm|please\s+confirm|correct\s*\?)\b/i.test(spoken)) return false;
+  const numberWords = {zero:'0',oh:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9'};
+  const expanded = spoken.replace(/\b(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/g,w=>numberWords[w])
+    .replace(/\s+at\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+period\s+/g,'.');
+  const escaped = c => c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const pattern = expected.split('').map(c=>escaped(c)).join('\\s*');
+  // No extra leading/trailing alphanumerics: match the *entire* email, never
+  // a suffix such as 6@gmail.com or a longer address sharing its prefix.
+  return new RegExp(`(?:^|[^a-z0-9])${pattern}(?![a-z0-9])`,'i').test(expanded);
 }
 
 function isAffirmativeBookingConfirmation(text) {
@@ -1345,6 +1381,7 @@ function createConnectionState(twilioWs) {
     customerName: '',
     customerPhone: '',
     customerEmail: '',
+    lastCallerEmailCandidate: '',
     customerAddress: '',
     activeEstimateId: '',
     activeEstimateServiceSignature: '',
@@ -1423,6 +1460,10 @@ function createConnectionState(twilioWs) {
     explicitResponseStarts: 0,
     automaticResponseStarts: 0,
     progressModelRequests: 0,
+    progressStaleResponsesSuppressed: 0,
+    progressResponseToolKey: null,
+    activeRealtimeResponseReason: '',
+    supersededProgressResponse: false,
     duplicateInternalContextsAvoided: 0,
     duplicateResponseRequestsAvoided: 0,
     sentInternalContext: new Set(),
@@ -2581,6 +2622,24 @@ function handleBookingNotesTool(state, callId, args = {}) {
   requestModelResponse(state, 'Ask exactly one question: "Would you like to add any notes for the appointment?" Then stop and wait.', 'booking_notes_choice_required', true);
 }
 
+// A tool result supersedes a not-yet-audible holding statement. Never clear
+// Twilio playback or cut a progress phrase that callers already heard. The
+// result continuation will queue behind the cancelled response and start as
+// soon as Realtime acknowledges cancellation.
+function supersedeStaleToolProgress(state, progressKey) {
+  if (state.progressResponseToolKey !== progressKey) return false;
+  const pending = state.responseRequestPending && state.pendingResponseReason === 'tool_progress';
+  const active = state.responseActive && state.activeRealtimeResponseReason === 'tool_progress';
+  if ((!pending && !active) || (active && state.responseHadAudio)) return false;
+  state.supersededProgressResponse = true;
+  state.progressStaleResponsesSuppressed += 1;
+  // A response.create can be in flight: response.created will cancel it once
+  // the API has assigned an active response. Never emit a speculative cancel
+  // against a response that does not exist yet.
+  if (active) safeSend(state.openaiWs, { type: 'response.cancel' });
+  return true;
+}
+
 async function executeNbbTool(state, name, callId, args = {}) {
   if (!state.sessionId) {
     acknowledgeFunction(state, callId, { success: false, code: 'voice_session_missing', message: 'Nearby Booker session is not ready yet.' });
@@ -2973,12 +3032,15 @@ async function executeNbbTool(state, name, callId, args = {}) {
     state.toolProgressTimers.set(progressKey, progressTimer);
   };
   const stopToolProgress = () => {
+    if (progressSettled) return; // success/catch/finally may all settle the same tool.
     progressSettled = true;
     if (progressTimer) clearTimeout(progressTimer);
     state.toolProgressTimers.delete(progressKey);
     // A progress message queued behind another response must not play after the
-    // actual availability/tool result has arrived.
+    // actual availability/tool result has arrived. If one was requested but
+    // never became audible, cancel it so the real result can speak instead.
     if (state.queuedResponseReason === 'tool_progress') clearQueuedResponse(state);
+    supersedeStaleToolProgress(state, progressKey);
   };
   const speakToolProgress = () => {
     if (progressSettled || state.ended || state.activeNbbToolCount < 1) return;
@@ -2996,7 +3058,8 @@ async function executeNbbTool(state, name, callId, args = {}) {
               'Say only: "This is taking a little longer, but I’m still checking." Do not claim a result.',
               'Say only: "I’m still working on those options." Do not claim a result.',
             ];
-      requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
+      const requested = requestModelResponse(state, messages[Math.min(progressCount, messages.length - 1)], 'tool_progress', false);
+      if (requested) state.progressResponseToolKey = progressKey;
       progressCount += 1;
     }
     scheduleToolProgress(progressInterval);
@@ -3278,7 +3341,11 @@ function handleOpenAIEvent(state, raw) {
     const id = String(event?.response?.id || '');
     const explicit = Boolean(state.responseRequestPending);
     const reason = explicit ? String(state.pendingResponseReason || 'explicit_unknown') : 'automatic';
+    state.activeRealtimeResponseReason = reason;
     if (id) state.responseReasonById.set(id, reason);
+    if (reason === 'tool_progress' && state.supersededProgressResponse) {
+      safeSend(state.openaiWs, { type: 'response.cancel' });
+    }
     if (explicit) state.explicitResponseStarts += 1;
     else state.automaticResponseStarts += 1;
     const now = Date.now();
@@ -3297,6 +3364,9 @@ function handleOpenAIEvent(state, raw) {
 
   // GA event is response.output_audio.delta. Accept the older alias defensively during API transitions.
   if ((type === 'response.output_audio.delta' || type === 'response.audio.delta') && event.delta) {
+    // The tool has already returned, and this obsolete progress response was
+    // cancelled before sending any caller audio. Discard late audio frames.
+    if (state.supersededProgressResponse && state.activeRealtimeResponseReason === 'tool_progress') return;
     if (state.messageMode && !state.messageResponsePhase) {
       safeSend(state.openaiWs, { type: 'response.cancel' });
       return;
@@ -3398,6 +3468,8 @@ function handleOpenAIEvent(state, raw) {
       });
 
       updateWorkflowIntentFromTranscript(state, transcript);
+      const offeredEmail = callerEmailCandidate(transcript);
+      if (offeredEmail) state.lastCallerEmailCandidate = offeredEmail;
       // Only explicit caller intent may revoke an already-confirmed email.
       // Model-proposed changes during prepare_booking remain overridden.
       if (state.confirmedEmail && requestsEmailChange(transcript)) {
@@ -3622,6 +3694,7 @@ function handleOpenAIEvent(state, raw) {
       }
       return;
     }
+    if (transcript && state.supersededProgressResponse && state.activeRealtimeResponseReason === 'tool_progress') return;
     if (transcript) {
       state.conversationMessages.push({ role: 'assistant', content: transcript });
       if (state.conversationMessages.length > 40) state.conversationMessages = state.conversationMessages.slice(-40);
@@ -3644,7 +3717,11 @@ function handleOpenAIEvent(state, raw) {
       // We do not lock it until the caller explicitly answers affirmatively.
       if (!state.pendingContactConfirmation && !state.confirmedEmail
           && ['booking', 'estimate'].includes(String(state.workflowIntent || ''))) {
-        const spokenCandidate = emailFromAssistantConfirmation(transcript);
+        const parsedReadback = emailFromAssistantConfirmation(transcript);
+        // Strictly match a complete readback against the caller's candidate
+        // when the spoken question has unfamiliar surrounding phrasing.
+        const spokenCandidate = parsedReadback || (readbackMatchesCallerEmail(transcript, state.lastCallerEmailCandidate)
+          ? state.lastCallerEmailCandidate : '');
         if (spokenCandidate) {
           state.pendingContactConfirmation = { type: 'email', value: spokenCandidate, context: 'spoken_readback' };
         }
@@ -3755,6 +3832,9 @@ function handleOpenAIEvent(state, raw) {
     if (type === 'response.done') captureRealtimeUsage(state, event);
     if (event?.response?.id) state.responseReasonById.delete(String(event.response.id));
     state.activeResponseTiming = null;
+    if (state.activeRealtimeResponseReason === 'tool_progress') state.progressResponseToolKey = null;
+    state.activeRealtimeResponseReason = '';
+    state.supersededProgressResponse = false;
     state.responseActive = false;
     state.responseRequestPending = false;
     state.aiAudioActive = false;
@@ -3906,7 +3986,7 @@ async function finishSession(state, disposition = 'ended') {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.51' }));
+    res.end(JSON.stringify({ ok: true, service: 'nearby-booker-voice-relay', version: '0.2.52' }));
     return;
   }
   res.writeHead(404, { 'content-type': 'application/json' });
